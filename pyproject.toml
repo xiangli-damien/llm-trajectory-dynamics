@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "llm-trajectory-dynamics"
+version = "0.1.0"
+description = "LLM trajectory dynamics data collection pipeline"
+authors = ["xiangli"]
+readme = "README.md"
+packages = [{ include = "lmd" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+transformers = ">=4.45,<5.0"
+huggingface-hub = ">=0.24,<1.0"
+accelerate = ">=0.27,<1.0"
+datasets = ">=2.18,<3.0"
+zarr = ">=2.17,<3.0"
+pyarrow = ">=15" 
+polars = ">=0.20,<1.0"
+tqdm = ">=4.66,<5.0"
+pyyaml = ">=6.0,<7.0"
+hydra-core = ">=1.3,<2.0"
+pytest = ">=8,<9"
+numpy = ">=1.26,<2.0"
+pandas = ">=2.2,<3.0"
+scikit-learn = ">=1.4,<2.0"
+matplotlib = ">=3.8,<4.0"
+seaborn = ">=0.13,<1.0"
+jsonlines = ">=4.0,<5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

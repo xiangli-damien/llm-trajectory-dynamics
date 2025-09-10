@@ -1,0 +1,54 @@
+"""
+LLM Trajectory Dynamics - A framework for analyzing hidden states during LLM inference.
+
+This package provides tools for collecting, storing, and analyzing hidden states
+from language models during text generation, enabling research into model behavior
+and trajectory dynamics.
+"""
+
+from pathlib import Path
+
+# Project configuration
+PROJECT_ROOT = Path(__file__).parent.parent
+STORAGE_ROOT = PROJECT_ROOT / "storage"
+CONFIG_ROOT = PROJECT_ROOT / "configs"
+
+# Version information
+__version__ = "2.0.0"
+__author__ = "LLM Trajectory Dynamics Team"
+
+# Main exports
+from .core import ModelManager, DataProcessor, HiddenStateExtractor, EvaluationEngine
+from .data import AnswerParser, PromptTemplateManager, DatasetRegistry
+from .storage import ZarrManager, ParquetManager, ExportManager
+from .utils.types import SampleRecord, GenerationConfig, HiddenStateSpec
+
+__all__ = [
+    # Core modules
+    "ModelManager",
+    "DataProcessor", 
+    "HiddenStateExtractor",
+    "EvaluationEngine",
+    
+    # Data modules
+    "AnswerParser",
+    "PromptTemplateManager",
+    "DatasetRegistry",
+    
+    # Storage modules
+    "ZarrManager",
+    "ParquetManager", 
+    "ExportManager",
+    
+    # Types
+    "SampleRecord",
+    "GenerationConfig",
+    "HiddenStateSpec",
+    
+    # Configuration
+    "PROJECT_ROOT",
+    "STORAGE_ROOT", 
+    "CONFIG_ROOT",
+    "__version__",
+    "__author__"
+]

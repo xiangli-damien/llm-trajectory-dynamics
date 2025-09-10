@@ -1,0 +1,159 @@
+"""Data processing pipeline for LLM trajectory analysis."""
+
+import torch
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+
+from .model_manager import ModelManager, GenerationResult
+from .hidden_state_extractor import HiddenStateExtractor, HiddenStateData
+from .evaluation_engine import EvaluationEngine, GenerationMetrics
+from ..data.answer_parser import AnswerParser
+from ..data.prompt_templates import PromptTemplateManager
+from ..utils.types import SampleRecord, GenerationConfig, HiddenStateSpec
+
+
+@dataclass
+class ProcessedSample:
+    """Result of processing a single sample."""
+    sample_id: int
+    prompt: str
+    generated_text: str
+    generated_text_raw: str  # Raw generated text without skipping special tokens
+    extracted_answer: str
+    is_correct: bool
+    hidden_state_data: HiddenStateData
+    generation_metrics: GenerationMetrics
+    finish_reason: str
+    answer_token_ids: List[int]
+    input_length: int  # Input token length
+    # Additional metadata fields
+    dataset: str
+    language: str
+    question: str
+    answer_gt: str
+    model: str  # Model name
+    answer_type: Optional[str] = None
+
+
+class DataProcessor:
+    """Main data processing pipeline for trajectory analysis."""
+    
+    def __init__(self, 
+                 model_manager: ModelManager,
+                 prompt_template_manager: PromptTemplateManager,
+                 answer_parser: AnswerParser,
+                 hidden_state_spec: HiddenStateSpec,
+                 per_token_dtype: str = "float16",
+                 stat_dtype: str = "float32"):
+        """Initialize data processor."""
+        self.model_manager = model_manager
+        self.prompt_template_manager = prompt_template_manager
+        self.answer_parser = answer_parser
+        self.hidden_state_extractor = HiddenStateExtractor(hidden_state_spec, per_token_dtype, stat_dtype)
+        self.evaluation_engine = EvaluationEngine()
+    
+    def process_sample(self, sample: SampleRecord, gen_config: GenerationConfig) -> ProcessedSample:
+        """Process a single sample through the complete pipeline."""
+        # Generate prompt
+        prompt = self.prompt_template_manager.get_prompt(
+            dataset=sample.dataset,
+            question=sample.question,
+            answer_type=sample.answer_type,
+            language=sample.language
+        )
+        
+        # Apply chat template
+        input_ids = self._apply_chat_template(prompt)
+        
+        # Generate sequence with hidden states
+        generation_result = self.model_manager.generate_sequence(input_ids, gen_config)
+        
+        # Decode generated text
+        generated_text = self.model_manager.tokenizer.decode(
+            generation_result.generated_tokens[0],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+        
+        # Decode generated text without skipping special tokens
+        generated_text_raw = self.model_manager.tokenizer.decode(
+            generation_result.generated_tokens[0],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False
+        )
+        
+        # Extract prompt-only hidden states for prompt_final_state
+        prompt_hidden_states = self._get_prompt_hidden_states(input_ids)
+        
+        # Extract hidden states
+        hidden_state_data = self.hidden_state_extractor.extract_from_generation(
+            generation_result, prompt_hidden_states
+        )
+        
+        # Compute generation metrics
+        generation_metrics = self.evaluation_engine.compute_generation_metrics(
+            generation_result.scores
+        )
+        
+        # Parse answer and check correctness
+        parse_result = self.answer_parser.parse_and_label(generated_text, sample)
+        
+        return ProcessedSample(
+            sample_id=sample.sample_id,
+            prompt=prompt,
+            generated_text=generated_text,
+            generated_text_raw=generated_text_raw,
+            extracted_answer=parse_result["extracted_answer"],
+            is_correct=parse_result["correct"],
+            hidden_state_data=hidden_state_data,
+            generation_metrics=generation_metrics,
+            finish_reason=generation_result.finish_reason,
+            answer_token_ids=generation_result.generated_tokens[0].tolist(),
+            input_length=generation_result.input_length,
+            # Pass through metadata
+            dataset=sample.dataset,
+            language=sample.language,
+            question=sample.question,
+            answer_gt=sample.answer_gt,
+            model=self.model_manager.model_name,
+            answer_type=sample.answer_type
+        )
+    
+    def process_batch(self, 
+                     samples: List[SampleRecord], 
+                     gen_config: GenerationConfig) -> List[ProcessedSample]:
+        """Process a batch of samples."""
+        results = []
+        for sample in samples:
+            try:
+                result = self.process_sample(sample, gen_config)
+                results.append(result)
+            except Exception as e:
+                # Log error and continue with next sample
+                print(f"Error processing sample {sample.sample_id}: {e}")
+                continue
+        
+        return results
+    
+    def _apply_chat_template(self, prompt: str) -> torch.Tensor:
+        """Apply chat template to prompt."""
+        messages = [{"role": "user", "content": prompt}]
+        return self.model_manager.apply_chat_template(messages)
+    
+    def _get_prompt_hidden_states(self, input_ids: torch.Tensor) -> List[torch.Tensor]:
+        """Get hidden states from prompt-only forward pass."""
+        device = next(self.model_manager.model.parameters()).device
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        
+        with torch.inference_mode():
+            outputs = self.model_manager.model(
+                input_ids=input_ids.to(device),
+                attention_mask=attention_mask.to(device),
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True
+            )
+            # Return hidden states from all layers (excluding embeddings)
+            return [h.to(torch.float32).cpu() for h in outputs.hidden_states[1:]]
