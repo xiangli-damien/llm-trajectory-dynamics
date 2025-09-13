@@ -1,31 +1,77 @@
 [tool.poetry]
 name = "llm-trajectory-dynamics"
-version = "0.1.0"
-description = "LLM trajectory dynamics data collection pipeline"
+version = "2.0.0"
+description = "LLM trajectory dynamics analysis framework with hidden state extraction"
 authors = ["xiangli"]
 readme = "README.md"
 packages = [{ include = "lmd" }]
 
 [tool.poetry.dependencies]
-python = "^3.10"
-transformers = ">=4.45,<5.0"
-huggingface-hub = ">=0.24,<1.0"
-accelerate = ">=0.27,<1.0"
-datasets = ">=2.18,<3.0"
-zarr = ">=2.17,<3.0"
-pyarrow = ">=15" 
-polars = ">=0.20,<1.0"
-tqdm = ">=4.66,<5.0"
-pyyaml = ">=6.0,<7.0"
-hydra-core = ">=1.3,<2.0"
-pytest = ">=8,<9"
-numpy = ">=1.26,<2.0"
-pandas = ">=2.2,<3.0"
-scikit-learn = ">=1.4,<2.0"
-matplotlib = ">=3.8,<4.0"
-seaborn = ">=0.13,<1.0"
-jsonlines = ">=4.0,<5.0"
+python = "^3.10,<3.11"
+
+# HF 生态
+transformers = ">=4.45.0,<4.46.0"
+accelerate = ">=0.34.0,<0.35.0"
+datasets = ">=2.21.0,<2.22.0"
+tokenizers = ">=0.20.0,<0.21.0"
+huggingface-hub = ">=0.24.0,<0.25.0"
+safetensors = ">=0.4.5,<0.5.0"
+
+# Data storage / 数值
+zarr = ">=2.18.0,<2.19.0"
+numcodecs = ">=0.13.0,<0.14.0"
+pyarrow = ">=17.0.0,<18.0.0"
+pandas = ">=2.2.0,<2.3.0"
+numpy = ">=1.26.0,<1.27.0"
+jsonlines = ">=4.0.0,<4.1.0"
+
+# Utils
+tqdm = ">=4.66.0,<4.67.0"
+pyyaml = ">=6.0.1,<6.1.0"
+hydra-core = ">=1.3.2,<1.4.0"
+omegaconf = ">=2.3.0,<2.4.0"
+
+# 可视化
+matplotlib = ">=3.9.0,<3.10.0"
+seaborn = ">=0.13.0,<0.14.0"
+
+# ML utils
+scikit-learn = ">=1.5.0,<1.6.0"
+scipy = ">=1.14.0,<1.15.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.3.0,<8.4.0"
+pytest-cov = ">=5.0.0,<5.1.0"
+black = ">=24.8.0,<24.9.0"
+isort = ">=5.13.0,<5.14.0"
+flake8 = ">=7.1.0,<7.2.0"
+mypy = ">=1.11.0,<1.12.0"
+ipykernel = ">=6.29.0,<6.30.0"
+jupyter = ">=1.0.0,<1.1.0"
+notebook = ">=7.2.0,<7.3.0"
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v --cov=lmd --cov-report=term-missing"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

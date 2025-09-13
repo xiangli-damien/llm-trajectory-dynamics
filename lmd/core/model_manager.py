@@ -60,6 +60,14 @@ class ModelManager:
             trust_remote_code=True
         )
         self._model.eval()
+
+        # Ensure generation config is consistent and silence HF warnings
+        gen_cfg = self._model.generation_config
+        gen_cfg.return_dict_in_generate = True
+        gen_cfg.output_hidden_states = True
+        gen_cfg.output_scores = True
+        if hasattr(gen_cfg, "top_k"):
+            gen_cfg.top_k = None
         
         # Load tokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(
@@ -176,6 +184,9 @@ class ModelManager:
         
         generated_tokens = sequences[:, input_length:]
         hidden_states = gen_output.hidden_states
+        if generated_length > 0 and (hidden_states is None or len(hidden_states) == 0):
+            raise RuntimeError("Hidden states not returned by generate(). Check generation config.")
+
         scores = gen_output.scores
         
         # Determine finish reason

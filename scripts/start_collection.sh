@@ -39,7 +39,7 @@ tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" \
         --model-root storage/models \
         --output-dir storage/runs \
         --models Qwen2-7B-Instruct \
-        --datasets mgsm gsm8k math commonsenseqa mmlu theoremqa hotpotqa \
+        --datasets mgsm gsm8k math commonsenseqa theoremqa mmlu belebele hotpotqa \
         --max-new-tokens 2048 \
         --language en \
         --seed 42 \
