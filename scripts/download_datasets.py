@@ -292,6 +292,56 @@ class UnifiedDatasetDownloader:
             logger.error(f"  Failed to download TheoremQA: {e}")
             return []
     
+    def download_belebele(self) -> List[Dict[str, Any]]:
+        """Download Belebele multilingual reading comprehension dataset"""
+        logger.info("Downloading Belebele dataset...")
+        
+        try:
+            # Load English configuration directly
+            dataset = load_dataset("facebook/belebele", "eng_Latn", split="test")
+            
+            data = []
+            for idx, item in enumerate(dataset):
+                if self.max_samples and idx >= self.max_samples:
+                    break
+                    
+                # Format question and options
+                question = item["question"]
+                passage = item["flores_passage"]
+                
+                # Build options
+                options = []
+                for i in range(1, 5):  # mc_answer1 to mc_answer4
+                    option_key = f"mc_answer{i}"
+                    if option_key in item:
+                        options.append(f"({chr(64+i)}) {item[option_key]}")
+                
+                # Combine into full question
+                full_question = f"Passage:\n{passage}\n\nQuestion: {question}\n\nChoices:\n" + "\n".join(options)
+                
+                # Convert answer number to letter (handle both string and int)
+                answer_num = item.get("correct_answer_num", 0)
+                if isinstance(answer_num, str):
+                    answer_num = int(answer_num) if answer_num.isdigit() else 0
+                answer = chr(64 + answer_num) if answer_num > 0 else ""
+                
+                unified = {
+                    "id": idx,
+                    "dataset": "belebele",
+                    "en": full_question,  # Use 'en' key as shown in their example
+                    "answer": answer,
+                    "type": "reading_comprehension",
+                    "language": "en"
+                }
+                data.append(unified)
+            
+            logger.info(f"  Downloaded {len(data)} Belebele samples")
+            return data
+            
+        except Exception as e:
+            logger.error(f"  Failed to download Belebele: {e}")
+            return []
+    
     def download_mmlu_complete(self) -> List[Dict[str, Any]]:
         """Download complete MMLU dataset (all 57 subjects, test split only)"""
         logger.info("Downloading MMLU dataset (all subjects)...")
@@ -422,7 +472,7 @@ def main():
                        help="Maximum samples per dataset (for testing)")
     parser.add_argument("--dataset", type=str, default="all",
                        choices=["all", "mgsm", "gsm8k", "math", 
-                               "commonsenseqa", "hotpotqa", "theoremqa", "mmlu"],
+                               "commonsenseqa", "hotpotqa", "theoremqa", "mmlu", "belebele"],
                        help="Specific dataset to download")
     args = parser.parse_args()
     
@@ -442,7 +492,8 @@ def main():
             "commonsenseqa": (downloader.download_commonsenseqa, "commonsenseqa.jsonl"),
             "hotpotqa": (downloader.download_hotpotqa, "hotpotqa.jsonl"),
             "theoremqa": (downloader.download_theoremqa, "theoremqa.jsonl"),
-            "mmlu": (downloader.download_mmlu_complete, "mmlu.jsonl")
+            "mmlu": (downloader.download_mmlu_complete, "mmlu.jsonl"),
+            "belebele": (downloader.download_belebele, "belebele.jsonl")
         }
         
         if args.dataset in dataset_map:

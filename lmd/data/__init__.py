@@ -1,8 +1,4 @@
-"""
-Data handling modules for LLM Trajectory Dynamics.
-
-This package contains data loading, parsing, and template management.
-"""
+"""Data handling modules."""
 
 from .answer_parser import AnswerParser
 from .prompt_templates import PromptTemplateManager

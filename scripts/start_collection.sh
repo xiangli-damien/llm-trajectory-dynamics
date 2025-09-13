@@ -1,13 +1,13 @@
 #!/bin/bash
-# Start data collection in tmux session
+# Full data collection script for LLM trajectory dynamics
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # Configuration
-SESSION_NAME="data_collection"
-LOG_DIR="logs"
+SESSION_NAME="llm_collection"
+LOG_DIR="storage/logs"
 OUTPUT_DIR="storage/runs"
 
 # Create directories
@@ -18,7 +18,7 @@ mkdir -p "$OUTPUT_DIR"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$LOG_DIR/collection_${TIMESTAMP}.log"
 
-echo "Starting data collection in tmux session..."
+echo "Starting LLM data collection in tmux session..."
 echo "Session name: $SESSION_NAME"
 echo "Log file: $LOG_FILE"
 echo "Start time: $(date)"
@@ -32,16 +32,15 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
 fi
 
 # Create new tmux session and run collection
+# Using the main CLI module with proper flags
 tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" \
-    "python -u scripts/collect_all_data.py \
-        --data_root storage/datasets \
-        --model_root storage/models \
-        --output_dir storage/runs \
+    "python -u -m lmd.cli.collect \
+        --data-root storage/datasets \
+        --model-root storage/models \
+        --output-dir storage/runs \
         --models Qwen2-7B-Instruct \
-        --datasets gsm8k mmlu mgsm math commonsenseqa hotpotqa theoremqa \
-        --full_collection \
-        --max_new_tokens 2048 \
-        --top_p 1.0 \
+        --datasets mgsm gsm8k math commonsenseqa mmlu theoremqa hotpotqa \
+        --max-new-tokens 2048 \
         --language en \
         --seed 42 \
         --verbose \
@@ -52,19 +51,19 @@ sleep 2
 
 # Check if session is running
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo ""
+    echo "=========================================="
     echo "Session '$SESSION_NAME' started successfully"
+    echo "=========================================="
     echo ""
-    echo "Useful commands:"
+    echo "Collection parameters:"
+    echo "  Models: Qwen2-7B-Instruct"
+    echo "  Datasets: mgsm, gsm8k, math, commonsenseqa, mmlu, theoremqa, hotpotqa"
+    echo ""
     echo "  Attach to session:    tmux attach -t $SESSION_NAME"
-    echo "  Detach from session:  Ctrl+B, then D"
-    echo "  Kill session:         tmux kill-session -t $SESSION_NAME"
-    echo "  List sessions:        tmux list-sessions"
-    echo ""
-    echo "Monitor progress:"
-    echo "  Real-time log:        tail -f $LOG_FILE"
-    echo "  Check status:         tmux list-sessions"
     echo ""
     echo "Output location: $OUTPUT_DIR"
+    echo "Log location: $LOG_FILE"
 else
     echo "Failed to start session"
     exit 1

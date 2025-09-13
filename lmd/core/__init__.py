@@ -1,9 +1,4 @@
-"""
-Core modules for LLM Trajectory Dynamics.
-
-This package contains the core business logic for collecting and analyzing
-hidden states from language models during inference.
-"""
+"""Core modules for LLM Trajectory Dynamics."""
 
 from .model_manager import ModelManager
 from .data_processor import DataProcessor

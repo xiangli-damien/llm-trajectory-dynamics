@@ -2,16 +2,23 @@
 
 import torch
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Optional
 from dataclasses import dataclass
-from pathlib import Path
 
-from .model_manager import ModelManager, GenerationResult
+from .model_manager import ModelManager
 from .hidden_state_extractor import HiddenStateExtractor, HiddenStateData
-from .evaluation_engine import EvaluationEngine, GenerationMetrics
+from .evaluation_engine import EvaluationEngine
 from ..data.answer_parser import AnswerParser
 from ..data.prompt_templates import PromptTemplateManager
 from ..utils.types import SampleRecord, GenerationConfig, HiddenStateSpec
+
+
+@dataclass
+class GenerationMetrics:
+    """Metrics computed from generation scores."""
+    max_probability: float
+    perplexity: float
+    entropy: float
 
 
 @dataclass
@@ -20,20 +27,19 @@ class ProcessedSample:
     sample_id: int
     prompt: str
     generated_text: str
-    generated_text_raw: str  # Raw generated text without skipping special tokens
     extracted_answer: str
     is_correct: bool
     hidden_state_data: HiddenStateData
     generation_metrics: GenerationMetrics
     finish_reason: str
     answer_token_ids: List[int]
-    input_length: int  # Input token length
-    # Additional metadata fields
+    input_length: int
+    # Metadata fields
     dataset: str
     language: str
     question: str
     answer_gt: str
-    model: str  # Model name
+    model: str
     answer_type: Optional[str] = None
 
 
@@ -44,14 +50,13 @@ class DataProcessor:
                  model_manager: ModelManager,
                  prompt_template_manager: PromptTemplateManager,
                  answer_parser: AnswerParser,
-                 hidden_state_spec: HiddenStateSpec,
-                 per_token_dtype: str = "float16",
-                 stat_dtype: str = "float32"):
+                 hidden_state_spec: HiddenStateSpec):
         """Initialize data processor."""
         self.model_manager = model_manager
         self.prompt_template_manager = prompt_template_manager
         self.answer_parser = answer_parser
-        self.hidden_state_extractor = HiddenStateExtractor(hidden_state_spec, per_token_dtype, stat_dtype)
+        # Pass model metadata to hidden state extractor
+        self.hidden_state_extractor = HiddenStateExtractor(hidden_state_spec, model_manager.metadata)
         self.evaluation_engine = EvaluationEngine()
     
     def process_sample(self, sample: SampleRecord, gen_config: GenerationConfig) -> ProcessedSample:
@@ -77,15 +82,10 @@ class DataProcessor:
             clean_up_tokenization_spaces=True
         )
         
-        # Decode generated text without skipping special tokens
-        generated_text_raw = self.model_manager.tokenizer.decode(
-            generation_result.generated_tokens[0],
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False
-        )
-        
         # Extract prompt-only hidden states for prompt_final_state
-        prompt_hidden_states = self._get_prompt_hidden_states(input_ids)
+        prompt_hidden_states = None
+        if self.hidden_state_extractor.spec.need_prompt_last:
+            prompt_hidden_states = self._get_prompt_hidden_states(input_ids)
         
         # Extract hidden states
         hidden_state_data = self.hidden_state_extractor.extract_from_generation(
@@ -104,7 +104,6 @@ class DataProcessor:
             sample_id=sample.sample_id,
             prompt=prompt,
             generated_text=generated_text,
-            generated_text_raw=generated_text_raw,
             extracted_answer=parse_result["extracted_answer"],
             is_correct=parse_result["correct"],
             hidden_state_data=hidden_state_data,
@@ -112,7 +111,7 @@ class DataProcessor:
             finish_reason=generation_result.finish_reason,
             answer_token_ids=generation_result.generated_tokens[0].tolist(),
             input_length=generation_result.input_length,
-            # Pass through metadata
+            # Metadata
             dataset=sample.dataset,
             language=sample.language,
             question=sample.question,
@@ -120,22 +119,6 @@ class DataProcessor:
             model=self.model_manager.model_name,
             answer_type=sample.answer_type
         )
-    
-    def process_batch(self, 
-                     samples: List[SampleRecord], 
-                     gen_config: GenerationConfig) -> List[ProcessedSample]:
-        """Process a batch of samples."""
-        results = []
-        for sample in samples:
-            try:
-                result = self.process_sample(sample, gen_config)
-                results.append(result)
-            except Exception as e:
-                # Log error and continue with next sample
-                print(f"Error processing sample {sample.sample_id}: {e}")
-                continue
-        
-        return results
     
     def _apply_chat_template(self, prompt: str) -> torch.Tensor:
         """Apply chat template to prompt."""
@@ -145,15 +128,13 @@ class DataProcessor:
     def _get_prompt_hidden_states(self, input_ids: torch.Tensor) -> List[torch.Tensor]:
         """Get hidden states from prompt-only forward pass."""
         device = next(self.model_manager.model.parameters()).device
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         
         with torch.inference_mode():
             outputs = self.model_manager.model(
                 input_ids=input_ids.to(device),
-                attention_mask=attention_mask.to(device),
                 output_hidden_states=True,
                 use_cache=False,
                 return_dict=True
             )
-            # Return hidden states from all layers (excluding embeddings)
-            return [h.to(torch.float32).cpu() for h in outputs.hidden_states[1:]]
+            # Return all layers including embedding
+            return [h.to(torch.float32).cpu() for h in outputs.hidden_states]

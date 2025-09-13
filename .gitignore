@@ -172,9 +172,20 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
-storage/models/
-storage/runs/
-storage/test_runs/
+# LMD analysis directory
+lmd/analysis/
+
+# Notebooks directory
+notebooks/
+
+# Storage directory (keep only datasets)
+storage/
+!storage/datasets/
+
+# Already ignored storage subdirectories
+# storage/models/
+# storage/runs/
+# storage/test_runs/
 logs/
 *.log
 all_code.txt

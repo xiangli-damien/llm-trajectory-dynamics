@@ -20,7 +20,6 @@ class GenerationResult:
     hidden_states: List[Tuple[torch.Tensor, ...]]
     scores: List[torch.Tensor]
     finish_reason: str
-    terminators: List[int]
 
 
 class ModelManager:
@@ -75,23 +74,53 @@ class ModelManager:
         
         # Extract metadata
         self._metadata = self._extract_metadata()
+        # Probe actual hidden state layer count
+        self._metadata.n_layers = self._probe_hidden_state_layers()
     
     def _extract_metadata(self) -> ModelMetadata:
         """Extract model metadata."""
-        def _get_attr(cfg, *candidates):
-            for key in candidates:
-                val = getattr(cfg, key, None)
-                if val is not None:
-                    return val
-            return None
+        config = self._config
+        
+        # Get base layer count
+        n_layers = getattr(config, "num_hidden_layers", None) or \
+                  getattr(config, "n_layer", None) or \
+                  getattr(config, "n_layers", None)
+        
+        # Placeholder - will be updated by probe
+        n_layers_with_emb = n_layers + 1 if n_layers else 0
         
         return ModelMetadata(
             model_name=self.model_name,
-            n_layers=_get_attr(self._config, "num_hidden_layers", "n_layer", "n_layers"),
-            hidden_dim=_get_attr(self._config, "hidden_size", "n_embd", "d_model"),
-            vocab_size=_get_attr(self._config, "vocab_size"),
-            model_type=_get_attr(self._config, "model_type")
+            n_layers=n_layers_with_emb,  # Will be updated by probe
+            hidden_dim=getattr(config, "hidden_size", None) or \
+                      getattr(config, "n_embd", None) or \
+                      getattr(config, "d_model", None),
+            vocab_size=getattr(config, "vocab_size", None),
+            model_type=getattr(config, "model_type", None)
         )
+    
+    def _probe_hidden_state_layers(self) -> int:
+        """Probe actual hidden state layer count from model."""
+        try:
+            # Create minimal input
+            tok = self._tokenizer("probe", return_tensors="pt").to(self._model.device)
+            
+            # Run forward pass to get hidden states
+            with torch.inference_mode():
+                out = self._model(**tok, output_hidden_states=True, use_cache=False, return_dict=True)
+            
+            # Count actual layers returned
+            hs = out.hidden_states
+            if isinstance(hs, (list, tuple)):
+                return len(hs)
+        except Exception:
+            pass
+        
+        # Fallback to config + 1
+        cfg_layers = getattr(self._config, "num_hidden_layers", None) or \
+                    getattr(self._config, "n_layer", None) or \
+                    getattr(self._config, "n_layers", None) or 0
+        return cfg_layers + 1
     
     @property
     def model(self) -> AutoModelForCausalLM:
@@ -108,13 +137,6 @@ class ModelManager:
         return self._tokenizer
     
     @property
-    def config(self) -> AutoConfig:
-        """Get the model configuration."""
-        if self._config is None:
-            raise RuntimeError("Config not loaded. Call load_model() first.")
-        return self._config
-    
-    @property
     def metadata(self) -> ModelMetadata:
         """Get the model metadata."""
         if self._metadata is None:
@@ -125,10 +147,10 @@ class ModelManager:
         """Generate text sequence with hidden states and scores."""
         device = next(self.model.parameters()).device
         
-        # Create attention mask to avoid pad_token=eos_token issues
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        # Create attention mask for safety
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         
-        # Collect termination tokens
+        # Get termination tokens
         terminators = self._get_termination_tokens()
         
         # Generate with hidden states and scores
@@ -169,30 +191,28 @@ class ModelManager:
             generated_length=generated_length,
             hidden_states=hidden_states,
             scores=scores,
-            finish_reason=finish_reason,
-            terminators=terminators
+            finish_reason=finish_reason
         )
     
     def _get_termination_tokens(self) -> List[int]:
         """Get list of termination tokens."""
         terminators = [self.tokenizer.eos_token_id]
         
-        if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
-            additional_terminators = ["<|eot_id|>", "<|im_end|>", "</s>"]
-            for term in additional_terminators:
-                try:
-                    term_id = self.tokenizer.convert_tokens_to_ids(term)
-                    if term_id is not None:
-                        terminators.append(term_id)
-                except Exception:
-                    pass
+        # Add model-specific terminators
+        special_terminators = ["<|eot_id|>", "<|im_end|>", "</s>"]
+        for term in special_terminators:
+            try:
+                term_id = self.tokenizer.convert_tokens_to_ids(term)
+                if term_id is not None and term_id not in terminators:
+                    terminators.append(term_id)
+            except:
+                pass
         
-        # Remove duplicates and None values
-        return [t for i, t in enumerate(terminators) if t is not None and t not in terminators[:i]]
+        return terminators
     
     def _determine_finish_reason(self, generated_tokens: torch.Tensor, 
-                               generated_length: int, max_tokens: int, 
-                               terminators: List[int]) -> str:
+                                generated_length: int, max_tokens: int, 
+                                terminators: List[int]) -> str:
         """Determine why generation finished."""
         if generated_length == 0:
             return "empty"

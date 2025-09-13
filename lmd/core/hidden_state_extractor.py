@@ -2,10 +2,10 @@
 
 import torch
 import numpy as np
-from typing import List, Tuple, Optional, Union
+from typing import List, Optional
 from dataclasses import dataclass
 
-from ..utils.types import HiddenStateSpec
+from ..utils.types import HiddenStateSpec, ModelMetadata
 
 
 @dataclass
@@ -20,28 +20,29 @@ class HiddenStateData:
 class HiddenStateExtractor:
     """Extracts and processes hidden states from model outputs."""
     
-    def __init__(self, spec: HiddenStateSpec, per_token_dtype: str = "float16", stat_dtype: str = "float32"):
-        """Initialize hidden state extractor."""
+    def __init__(self, spec: HiddenStateSpec, model_meta: ModelMetadata):
+        """Initialize hidden state extractor with model metadata."""
         self.spec = spec
-        self.per_token_dtype = per_token_dtype
-        self.stat_dtype = stat_dtype
+        self.model_meta = model_meta
+    
+    def _zeros_lh(self, dtype=np.float32):
+        """Create zero array with correct layer and hidden dimensions."""
+        return np.zeros((self.model_meta.n_layers, self.model_meta.hidden_dim), dtype=dtype)
     
     def extract_from_generation(self, 
                               generation_result,
                               prompt_hidden_states: List[torch.Tensor]) -> HiddenStateData:
-        """Extract hidden states from generation result."""
-        # Extract per-token states for answer tokens
-        expected_layers = len(prompt_hidden_states)  # Align with prompt (excluding embedding)
-        per_token_states = None
-        if self.spec.need_per_token and generation_result.generated_length > 0:
-            per_token_states = self._extract_per_token_states(
-                generation_result.hidden_states, expected_layers=expected_layers
-            )
+        """Extract hidden states from generation result"""
+        hidden_states = generation_result.hidden_states
+        generated_length = generation_result.generated_length
         
-        # Compute mean states
-        mean_states = self._compute_mean_states(
-            per_token_states, generation_result.generated_length, prompt_hidden_states
-        )
+        # Extract per-token states if needed
+        per_token_states = None
+        if self.spec.need_per_token and generated_length > 0:
+            per_token_states = self._extract_per_token_states(hidden_states, generated_length)
+        
+        # Compute mean states (CoE-aligned: mean of ALL generated tokens including EOS)
+        mean_states = self._compute_mean_states(hidden_states, generated_length)
         
         # Extract prompt final state
         prompt_final_state = self._extract_prompt_final_state(prompt_hidden_states)
@@ -50,92 +51,100 @@ class HiddenStateExtractor:
             per_token_states=per_token_states,
             mean_states=mean_states,
             prompt_final_state=prompt_final_state,
-            answer_token_count=generation_result.generated_length
+            answer_token_count=generated_length
         )
     
-    def _extract_per_token_states(self, hidden_states: List[Tuple[torch.Tensor, ...]], expected_layers: int) -> np.ndarray:
+    def _extract_per_token_states(self, hidden_states: List, generated_length: int) -> np.ndarray:
         """Extract per-token hidden states from generation steps."""
-        if not hidden_states:
-            # Return None to trigger upper-level zero vector fallback, avoid shape crash
+        if not hidden_states or generated_length == 0:
             return None
         
-        per_token_data = []
-        num_steps = len(hidden_states)
-        target_dtype_torch = torch.float16 if self.per_token_dtype == "float16" else torch.float32
-        target_dtype_np = np.float16 if self.per_token_dtype == "float16" else np.float32
+        # Get layer count from first step
+        num_layers = len(hidden_states[0])
         
-        for step_idx in range(num_steps):
-            layers = list(hidden_states[step_idx])
-            if len(layers) == expected_layers + 1:
-                layers = layers[1:]
-            elif len(layers) != expected_layers and len(layers) > 1:
-                try:
-                    if layers[0].shape[-1] == layers[1].shape[-1]:
-                        layers = layers[1:]
-                except Exception:
-                    pass
+        # Collect all token states
+        per_token_data = []
+        for step_idx in range(generated_length):
+            step_states = hidden_states[step_idx]
             
+            # Extract hidden state for current token at each layer
             layer_vectors = []
-            for layer_output in layers:
-                if layer_output.dim() == 3:
-                    vector = layer_output[0, 0, :].to(target_dtype_torch).cpu().numpy().astype(target_dtype_np)
+            for layer_idx in range(num_layers):
+                # Get the last token's hidden state (newly generated token)
+                hs = step_states[layer_idx]
+                if hs.dim() == 3:
+                    vector = hs[0, -1, :].float().cpu().numpy()
+                elif hs.dim() == 2:
+                    vector = hs[-1, :].float().cpu().numpy()
                 else:
-                    vector = layer_output[0, :].to(target_dtype_torch).cpu().numpy().astype(target_dtype_np)
+                    vector = hs[0, :].float().cpu().numpy()
                 layer_vectors.append(vector)
             
             per_token_data.append(np.stack(layer_vectors, axis=0))
         
-        return np.stack(per_token_data, axis=0).astype(target_dtype_np)
+        return np.stack(per_token_data, axis=0).astype(np.float16)
     
-    def _compute_mean_states(self, 
-                           per_token_states: Optional[np.ndarray],
-                           generated_length: int,
-                           prompt_hidden_states: List[torch.Tensor]) -> np.ndarray:
-        """Compute mean hidden states across answer tokens."""
-        target_dtype = np.float32 if self.stat_dtype == "float32" else np.float16
+    def _compute_mean_states(self, hidden_states: List, generated_length: int) -> np.ndarray:
+        """
+        Compute mean hidden states across answer tokens.
+        Aligns with CoE: includes ALL generated tokens (including EOS if present).
+        """
+        if not hidden_states or generated_length == 0:
+            # Return zeros with correct shape
+            return self._zeros_lh(np.float32)
         
-        if generated_length == 0:
-            num_layers = len(prompt_hidden_states)
-            hidden_dim = prompt_hidden_states[0].shape[-1]
-            return np.zeros((num_layers, hidden_dim), dtype=target_dtype)
+        # Get layer count
+        num_layers = len(hidden_states[0])
         
-        if per_token_states is not None:
-            return per_token_states.mean(axis=0, dtype=target_dtype)
-        else:
-            num_layers = len(prompt_hidden_states)
-            hidden_dim = prompt_hidden_states[0].shape[-1]
-            return np.zeros((num_layers, hidden_dim), dtype=target_dtype)
+        # Verify layer count matches metadata
+        if num_layers != self.model_meta.n_layers:
+            print(f"Warning: Layer mismatch - runtime={num_layers}, metadata={self.model_meta.n_layers}")
+            # Use minimum to avoid index errors
+            num_layers = min(num_layers, self.model_meta.n_layers)
+        
+        # Collect states from all generated tokens
+        layer_means = []
+        for layer_idx in range(num_layers):
+            token_states = []
+            
+            # Collect states from each generation step
+            for step_idx in range(generated_length):
+                step_states = hidden_states[step_idx]
+                hs = step_states[layer_idx]
+                
+                # Extract last token's state (newly generated) with robust shape handling
+                if hs.dim() == 3:
+                    vector = hs[0, -1, :].float().cpu().numpy()
+                elif hs.dim() == 2:
+                    vector = hs[-1, :].float().cpu().numpy()
+                else:
+                    vector = hs[0, :].float().cpu().numpy()
+                token_states.append(vector)
+            
+            # Compute mean for this layer
+            layer_mean = np.mean(token_states, axis=0, dtype=np.float32)
+            layer_means.append(layer_mean)
+        
+        # Pad with zeros if fewer layers than expected
+        while len(layer_means) < self.model_meta.n_layers:
+            layer_means.append(np.zeros(self.model_meta.hidden_dim, dtype=np.float32))
+        
+        return np.stack(layer_means, axis=0).astype(np.float32)
     
     def _extract_prompt_final_state(self, prompt_hidden_states: List[torch.Tensor]) -> np.ndarray:
         """Extract hidden state of the final prompt token."""
-        layer_vectors = []
-        target_dtype_torch = torch.float32 if self.stat_dtype == "float32" else torch.float16
-        target_dtype_np = np.float32 if self.stat_dtype == "float32" else np.float16
+        if not prompt_hidden_states:
+            # Return zeros with correct shape
+            return self._zeros_lh(np.float32)
         
+        layer_vectors = []
         for layer_output in prompt_hidden_states:
-            vector = layer_output[0, -1, :].to(target_dtype_torch).cpu().numpy().astype(target_dtype_np)
+            # Get last token of prompt
+            vector = layer_output[0, -1, :].float().cpu().numpy()
             layer_vectors.append(vector)
         
-        return np.stack(layer_vectors, axis=0).astype(target_dtype_np)
-    
-    def extract_from_full_forward(self, 
-                                full_hidden_states: List[torch.Tensor],
-                                answer_span: Tuple[int, int]) -> np.ndarray:
-        """Extract per-token states from full forward pass (legacy method)."""
-        start_idx, end_idx = answer_span
-        layer_vectors = []
-        target_dtype_np = np.float16 if self.per_token_dtype == "float16" else np.float32
+        # Pad if needed
+        while len(layer_vectors) < self.model_meta.n_layers:
+            layer_vectors.append(np.zeros(self.model_meta.hidden_dim, dtype=np.float32))
         
-        for layer_output in full_hidden_states:
-            answer_tokens = layer_output[0, start_idx:end_idx, :].to(
-                torch.float16 if self.per_token_dtype == "float16" else torch.float32
-            ).cpu().numpy().astype(target_dtype_np)
-            layer_vectors.append(answer_tokens)
-        
-        result = np.stack(layer_vectors, axis=1)
-        return result.astype(target_dtype_np)
-    
-    @staticmethod
-    def locate_answer_span(input_length: int, generated_length: int) -> Tuple[int, int]:
-        """Locate answer token span in full sequence."""
-        return (input_length, input_length + generated_length)
+        return np.stack(layer_vectors[:self.model_meta.n_layers], axis=0).astype(np.float32)

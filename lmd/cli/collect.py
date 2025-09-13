@@ -1,307 +1,337 @@
-"""Main CLI for data collection."""
+#!/usr/bin/env python3
+"""Unified data collection CLI for LLM hidden states."""
 
 import argparse
 import json
 import time
+import torch
+import gc
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
-
+from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 
-# Optional psutil import for memory monitoring
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-
-from ..core import ModelManager, DataProcessor, HiddenStateExtractor, EvaluationEngine
+from ..core import ModelManager, DataProcessor
 from ..data import AnswerParser, PromptTemplateManager, DatasetRegistry
 from ..storage import ZarrManager, ParquetManager
-from ..utils.types import GenerationConfig, HiddenStateSpec, CollectionConfig, StorageConfig
+from ..utils.types import GenerationConfig, HiddenStateSpec
 from ..utils.seed import set_seed
 
 
-def create_argument_parser() -> argparse.ArgumentParser:
-    """Create command line argument parser."""
-    parser = argparse.ArgumentParser(
-        description="Collect hidden states from LLM inference",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+class DataCollector:
+    """Manages data collection across models and datasets."""
     
-    # Model configuration
-    parser.add_argument("--model-name", type=str, required=True, help="Model identifier")
-    parser.add_argument("--model-dir", type=str, required=True, help="Model directory path")
-    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float32", "float16", "bfloat16"], help="Model data type")
-    parser.add_argument("--device-map", type=str, default="auto", help="Device mapping strategy")
+    AVAILABLE_MODELS = [
+        "Llama-3-8B-Instruct",
+        "Mistral-7B-Instruct-v0.2", 
+        "Qwen2-7B-Instruct"
+    ]
     
-    # Dataset configuration
-    parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
-    parser.add_argument("--data-dir", type=str, default="storage/datasets", help="Data directory")
-    parser.add_argument("--language", type=str, default="en", help="Language code")
-    parser.add_argument("--max-samples", type=int, help="Maximum samples to process")
+    AVAILABLE_DATASETS = [
+        "mmlu",
+        "gsm8k",
+        "mgsm", 
+        "math",
+        "commonsenseqa",
+        "hotpotqa",
+        "theoremqa",
+        "belebele"
+    ]
     
-    # Generation configuration
-    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.0, help="Generation temperature")
-    parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling")
-    parser.add_argument("--do-sample", action="store_true", help="Enable sampling")
-    
-    # Hidden state configuration
-    parser.add_argument("--save-per-token", dest="save_per_token", action="store_true")
-    parser.add_argument("--no-save-per-token", dest="save_per_token", action="store_false")
-    parser.set_defaults(save_per_token=True)
-    
-    parser.add_argument("--save-mean", dest="save_mean", action="store_true")
-    parser.add_argument("--no-save-mean", dest="save_mean", action="store_false")
-    parser.set_defaults(save_mean=True)
-    
-    parser.add_argument("--save-prompt-last", dest="save_prompt_last", action="store_true")
-    parser.add_argument("--no-save-prompt-last", dest="save_prompt_last", action="store_false")
-    parser.set_defaults(save_prompt_last=True)
-    
-    # Storage configuration
-    parser.add_argument("--output-dir", type=str, required=True, help="Output directory")
-    parser.add_argument("--run-id", type=str, help="Run identifier (auto-generated if not provided)")
-    parser.add_argument("--zarr-dtype", type=str, default="float32", choices=["float32", "float16"], help="Zarr storage data type")
-    
-    # Other options
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--verbose", action="store_true", help="Verbose output")
-    
-    return parser
-
-
-def main() -> None:
-    """Main CLI entry point."""
-    parser = create_argument_parser()
-    args = parser.parse_args()
-    
-    # Set random seed
-    set_seed(args.seed)
-    
-    # Generate run ID if not provided
-    run_id = args.run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # Create output directory
-    output_dir = Path(args.output_dir) / run_id
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        # Initialize components
-        print("Initializing components...")
+    def __init__(self, args):
+        """Initialize data collector with arguments."""
+        self.args = args
+        self.data_root = Path(args.data_root)
+        self.model_root = Path(args.model_root)
+        self.output_root = self._setup_output_dir()
         
-        # Model manager
-        model_manager = ModelManager(
-            model_name=args.model_name,
-            model_path=args.model_dir,
-            device_map=args.device_map,
-            dtype=args.dtype
-        )
-        model_manager.load_model()
-        
-        # Data components
-        prompt_template_manager = PromptTemplateManager()
-        answer_parser = AnswerParser(args.dataset)
-        dataset_registry = DatasetRegistry(Path(args.data_dir))
-        
-        # Load samples
-        print(f"Loading samples from {args.dataset}...")
-        samples = dataset_registry.load_samples(
-            dataset_name=args.dataset,
-            language=args.language,
-            max_samples=args.max_samples
-        )
-        print(f"Loaded {len(samples)} samples")
-        
-        # Configuration
-        gen_config = GenerationConfig(
+        # Initialize configurations
+        self.gen_config = GenerationConfig(
             max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            do_sample=args.do_sample
+            temperature=0.0,
+            top_p=1.0,
+            do_sample=False
         )
         
-        hidden_state_spec = HiddenStateSpec(
+        self.hidden_state_spec = HiddenStateSpec(
             need_per_token=args.save_per_token,
             need_mean=args.save_mean,
             need_prompt_last=args.save_prompt_last
         )
         
-        # Data processor
+        # Results tracking
+        self.results = {
+            "run_id": self.output_root.name,
+            "start_time": datetime.now().isoformat(),
+            "configuration": vars(args),
+            "models": {}
+        }
+    
+    def _setup_output_dir(self) -> Path:
+        """Setup output directory with proper run ID."""
+        output_dir = Path(self.args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.args.resume and self.args.run_id:
+            run_dir = output_dir / self.args.run_id
+            if not run_dir.exists():
+                raise ValueError(f"Resume directory {run_dir} not found")
+            print(f"Resuming run: {self.args.run_id}")
+            return run_dir
+        
+        # Create new run directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        models_str = f"m{len(self.args.models)}"
+        datasets_str = f"d{len(self.args.datasets)}"
+        run_id = f"run_{timestamp}_{models_str}_{datasets_str}"
+        
+        run_dir = output_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+    
+    def collect_all(self):
+        """Main collection loop across all models and datasets."""
+        total_start = time.time()
+        
+        print("\n" + "="*80)
+        print(f"{'DATA COLLECTION CONFIGURATION':^80}")
+        print("="*80)
+        print(f"Output: {self.output_root}")
+        print(f"Models: {', '.join(self.args.models)}")
+        print(f"Datasets: {', '.join(self.args.datasets)}")
+        print(f"Max samples: {self.args.max_samples or 'All'}")
+        print(f"Max tokens: {self.args.max_new_tokens}")
+        print("="*80 + "\n")
+        
+        for model_name in self.args.models:
+            self.results["models"][model_name] = self._collect_model(model_name)
+        
+        # Save final results
+        total_time = time.time() - total_start
+        self.results["end_time"] = datetime.now().isoformat()
+        self.results["total_time_seconds"] = total_time
+        
+        results_file = self.output_root / "collection_results.json"
+        with open(results_file, 'w') as f:
+            json.dump(self.results, f, indent=2)
+        
+        self._print_summary(total_time)
+    
+    def _collect_model(self, model_name: str) -> Dict[str, Any]:
+        """Collect data for a single model across all datasets."""
+        print(f"\n{'='*60}")
+        print(f"Processing Model: {model_name}")
+        print(f"{'='*60}\n")
+        
+        # Clear GPU memory
+        self._clear_gpu_memory()
+        
+        # Load model
+        model_manager = ModelManager(
+            model_name=model_name,
+            model_path=str(self.model_root / model_name)
+        )
+        model_manager.load_model()
+        print(f"✓ Model loaded: {model_manager.metadata.n_layers} layers, {model_manager.metadata.hidden_dim} dim")
+        
+        # Process each dataset
+        model_results = {
+            "model_name": model_name,
+            "start_time": datetime.now().isoformat(),
+            "datasets": {}
+        }
+        
+        for dataset_name in self.args.datasets:
+            dataset_result = self._collect_dataset(model_manager, dataset_name)
+            model_results["datasets"][dataset_name] = dataset_result
+        
+        # Cleanup
+        del model_manager
+        self._clear_gpu_memory()
+        
+        model_results["end_time"] = datetime.now().isoformat()
+        return model_results
+    
+    def _collect_dataset(self, model_manager: ModelManager, dataset_name: str) -> Dict[str, Any]:
+        """Collect data for a single dataset."""
+        print(f"\nProcessing {dataset_name}...")
+        
+        # Setup components
+        prompt_template_manager = PromptTemplateManager()
+        answer_parser = AnswerParser(dataset_name)
+        dataset_registry = DatasetRegistry(self.data_root)
+        
+        # Load samples
+        samples = dataset_registry.load_samples(
+            dataset_name=dataset_name,
+            language=self.args.language,
+            max_samples=self.args.max_samples
+        )
+        n_samples = len(samples)
+        
+        # Initialize processor
         data_processor = DataProcessor(
             model_manager=model_manager,
             prompt_template_manager=prompt_template_manager,
             answer_parser=answer_parser,
-            hidden_state_spec=hidden_state_spec
+            hidden_state_spec=self.hidden_state_spec
         )
         
-        # Storage managers
-        zarr_path = output_dir / "zarr" / f"{args.model_name}__{args.dataset}__{args.language}"
+        # Setup storage
+        zarr_path = self.output_root / "zarr" / f"{model_manager.model_name}__{dataset_name}__{self.args.language}"
         zarr_manager = ZarrManager(
             storage_path=zarr_path,
             model_metadata=model_manager.metadata,
-            hidden_state_spec=hidden_state_spec,
-            n_samples_estimate=len(samples),
-            per_token_dtype="float16" if args.zarr_dtype == "float16" else "float32",
-            mean_dtype="float32",
-            prompt_dtype="float32"
+            hidden_state_spec=self.hidden_state_spec,
+            n_samples_estimate=n_samples
         )
         
-        parquet_manager = ParquetManager(output_dir)
+        parquet_path = self.output_root / "parquet" / model_manager.model_name / dataset_name
+        parquet_manager = ParquetManager(parquet_path)
         
-        # Create JSONL metadata file
-        meta_dir = output_dir / "meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-        meta_file = (meta_dir / f"{args.model_name}_{args.dataset}_samples.jsonl").open("a", encoding="utf-8")
+        # Check resume position
+        start_idx = 0
+        if self.args.resume:
+            start_idx = zarr_manager.get_resume_index()
+            if self.args.verbose and start_idx > 0:
+                print(f"Resuming {dataset_name} at sample index {start_idx}")
         
-        # Process samples with progress tracking
-        print("Processing samples...")
+        # Process samples
         processed_samples = []
+        correct_count = 0
         error_count = 0
-        start_time = time.time()
         
-        # Initialize progress bar
-        progress_bar = tqdm(
-            total=len(samples),
-            desc="Processing",
-            unit="sample",
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
-        )
-        
-        for i, sample in enumerate(samples):
-            try:
-                processed = data_processor.process_sample(sample, gen_config)
-                processed_samples.append(processed)
+        with tqdm(total=n_samples, desc=f"{dataset_name:15}", unit="sample", initial=start_idx) as pbar:
+            for i, sample in enumerate(samples):
+                if i < start_idx:
+                    continue
+                    
+                try:
+                    # Process sample
+                    processed = data_processor.process_sample(sample, self.gen_config)
+                    processed_samples.append(processed)
+                    
+                    if processed.is_correct:
+                        correct_count += 1
+                    
+                    # Save to Zarr
+                    zarr_manager.save_sample(
+                        sample_idx=i,
+                        hidden_state_data=processed.hidden_state_data,
+                        metadata={
+                            "sample_id": processed.sample_id,
+                            "is_correct": processed.is_correct,
+                            "answer_token_count": processed.hidden_state_data.answer_token_count
+                        }
+                    )
+                    
+                    # Update progress
+                    acc = correct_count / len(processed_samples) * 100
+                    pbar.set_postfix({'Acc': f"{acc:.1f}%", 'Err': error_count})
+                    
+                except Exception as e:
+                    error_count += 1
+                    zarr_manager.mark_empty(sample_idx=i, sample_id=sample.sample_id)
+                    if self.args.verbose:
+                        print(f"\nError on sample {i}: {e}")
                 
-                # Save to storage
-                zarr_manager.save_sample(
-                    sample_idx=i,
-                    hidden_state_data=processed.hidden_state_data,
-                    metadata={
-                        "sample_id": processed.sample_id,
-                        "dataset": processed.dataset,
-                        "language": processed.language,
-                        "question": processed.question,
-                        "ground_truth": processed.answer_gt,
-                        "generated_text": processed.generated_text,
-                        "extracted_answer": processed.extracted_answer,
-                        "is_correct": processed.is_correct,
-                        "finish_reason": processed.finish_reason,
-                        "input_length": processed.input_length,
-                        "answer_token_count": processed.hidden_state_data.answer_token_count
-                    }
-                )
+                pbar.update(1)
                 
-                # Write to JSONL metadata
-                meta_row = {
-                    "sample_id": processed.sample_id,
-                    "dataset": processed.dataset,
-                    "language": processed.language,
-                    "model": processed.model,
-                    "question": processed.question,
-                    "answer_gt": processed.answer_gt,
-                    "prompt": processed.prompt,
-                    "generated_text": processed.generated_text,
-                    "generated_text_raw": processed.generated_text_raw,
-                    "extracted_answer": processed.extracted_answer,
-                    "is_correct": processed.is_correct,
-                    "finish_reason": processed.finish_reason,
-                    "metrics": {
-                        "max_probability": processed.generation_metrics.max_probability,
-                        "perplexity": processed.generation_metrics.perplexity,
-                        "entropy": processed.generation_metrics.entropy
-                    },
-                    "token_counts": {
-                        "prompt_length": processed.input_length,
-                        "generated_length": len(processed.answer_token_ids),
-                        "answer_token_count": processed.hidden_state_data.answer_token_count
-                    },
-                    "hidden_states": {
-                        "has_per_token": processed.hidden_state_data.per_token_states is not None,
-                        "answer_token_count": processed.hidden_state_data.answer_token_count
-                    }
-                }
-                meta_file.write(json.dumps(meta_row, ensure_ascii=False) + "\n")
-                
-                # Update progress metrics
-                success_rate = len(processed_samples) / (i + 1) * 100
-                memory_usage = f"{psutil.Process().memory_info().rss / 1024 / 1024:.0f}MB" if PSUTIL_AVAILABLE else "N/A"
-                
-                progress_bar.set_postfix({
-                    'Sample': sample.sample_id,
-                    'Success': f"{success_rate:.1f}%",
-                    'Errors': error_count,
-                    'Memory': memory_usage
-                })
-                
-            except Exception as e:
-                error_count += 1
-                # Mark empty sample to maintain pointer alignment
-                zarr_manager.mark_empty(sample_idx=i, sample_id=sample.sample_id)
-                if args.verbose:
-                    print(f"\nError processing sample {sample.sample_id}: {e}")
-            
-            progress_bar.update(1)
-        
-        progress_bar.close()
+                # Periodic GPU cleanup
+                if (i + 1) % 50 == 0:
+                    torch.cuda.empty_cache()
         
         # Finalize storage
-        print("Finalizing storage...")
         zarr_manager.finalize()
-        
-        # Save metadata and outputs
         parquet_manager.save_metadata(processed_samples)
         parquet_manager.save_outputs(processed_samples)
         
-        # Close JSONL metadata file
-        meta_file.close()
+        # Return statistics
+        accuracy = correct_count / len(processed_samples) if processed_samples else 0
+        print(f"✓ {dataset_name}: {correct_count}/{n_samples} correct ({accuracy:.1%})")
         
-        # Save run configuration
-        config = {
-            "run_id": run_id,
-            "model_name": args.model_name,
-            "dataset": args.dataset,
-            "language": args.language,
-            "n_samples": len(processed_samples),
-            "generation_config": {
-                "max_new_tokens": args.max_new_tokens,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "do_sample": args.do_sample
-            },
-            "hidden_state_spec": {
-                "need_per_token": args.save_per_token,
-                "need_mean": args.save_mean,
-                "need_prompt_last": args.save_prompt_last
-            },
-            "timestamp": datetime.now().isoformat(),
-            "seed": args.seed
+        return {
+            "n_samples": n_samples,
+            "n_processed": len(processed_samples),
+            "n_correct": correct_count,
+            "n_errors": error_count,
+            "accuracy": accuracy
         }
+    
+    def _clear_gpu_memory(self):
+        """Clear GPU memory."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    def _print_summary(self, total_time: float):
+        """Print collection summary."""
+        print("\n" + "="*80)
+        print(f"{'COLLECTION COMPLETE':^80}")
+        print("="*80)
         
-        with open(output_dir / "config.json", "w") as f:
-            json.dump(config, f, indent=2)
+        total_samples = 0
+        total_correct = 0
         
-        # Print summary
-        total_time = time.time() - start_time
-        correct_count = sum(1 for s in processed_samples if s.is_correct)
-        accuracy = correct_count / len(processed_samples) if processed_samples else 0.0
-        avg_tokens = sum(s.hidden_state_data.answer_token_count for s in processed_samples) / len(processed_samples) if processed_samples else 0.0
+        for model_name, model_data in self.results["models"].items():
+            print(f"\n{model_name}:")
+            for dataset_name, stats in model_data.get("datasets", {}).items():
+                n_samples = stats.get("n_samples", 0)
+                n_correct = stats.get("n_correct", 0)
+                acc = stats.get("accuracy", 0)
+                print(f"  {dataset_name:15}: {n_correct:4}/{n_samples:4} ({acc:.1%})")
+                total_samples += n_samples
+                total_correct += n_correct
         
-        print(f"\nCollection Complete!")
-        print(f"Results saved to: {output_dir}")
-        print(f"Total samples: {len(samples)}")
-        print(f"Processed: {len(processed_samples)}")
-        print(f"Errors: {error_count}")
-        print(f"Success rate: {len(processed_samples)/len(samples)*100:.1f}%")
-        print(f"Accuracy: {accuracy:.2%}")
-        print(f"Avg tokens: {avg_tokens:.1f}")
-        print(f"Time: {total_time/60:.1f}min ({len(samples)/total_time:.1f} samples/sec)")
-        
-    except Exception as e:
-        print(f"Error during collection: {e}")
-        raise
+        print(f"\nTotal: {total_correct}/{total_samples} ({total_correct/total_samples*100:.1%})")
+        print(f"Time: {total_time/60:.1f} minutes")
+        print(f"Output: {self.output_root}")
+        print("="*80)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="Collect hidden states from LLM inference")
+    
+    # Paths
+    parser.add_argument("--data-root", type=str, default="storage/datasets")
+    parser.add_argument("--model-root", type=str, default="storage/models")
+    parser.add_argument("--output-dir", type=str, default="storage/runs")
+    
+    # Selection
+    parser.add_argument("--models", nargs="+", default=DataCollector.AVAILABLE_MODELS,
+                       choices=DataCollector.AVAILABLE_MODELS)
+    parser.add_argument("--datasets", nargs="+", default=DataCollector.AVAILABLE_DATASETS,
+                       choices=DataCollector.AVAILABLE_DATASETS)
+    
+    # Parameters
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--language", type=str, default="en")
+    
+    # Hidden states - Fixed to allow turning off
+    parser.add_argument("--save-per-token", dest="save_per_token", action="store_true", default=True)
+    parser.add_argument("--no-save-per-token", dest="save_per_token", action="store_false")
+    parser.add_argument("--save-mean", dest="save_mean", action="store_true", default=True)
+    parser.add_argument("--no-save-mean", dest="save_mean", action="store_false")
+    parser.add_argument("--save-prompt-last", dest="save_prompt_last", action="store_true", default=True)
+    parser.add_argument("--no-save-prompt-last", dest="save_prompt_last", action="store_false")
+    
+    # Options
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--run-id", type=str, help="Resume specific run")
+    
+    args = parser.parse_args()
+    
+    # Set seed
+    set_seed(args.seed)
+    
+    # Run collection
+    collector = DataCollector(args)
+    collector.collect_all()
 
 
 if __name__ == "__main__":
