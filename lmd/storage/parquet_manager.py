@@ -14,7 +14,10 @@ class ParquetManager:
         self.output_dir.mkdir(parents=True, exist_ok=True)
     
     def save_metadata(self, processed_samples: List) -> None:
-        """Save metadata to Parquet file."""
+        """Save metadata to Parquet file (append mode for resume)."""
+        if not processed_samples:  # avoid empty list overwriting
+            return
+            
         metadata_rows = []
         
         for sample in processed_samples:
@@ -35,10 +38,23 @@ class ParquetManager:
             })
         
         df = pd.DataFrame(metadata_rows)
-        df.to_parquet(self.output_dir / "metadata.parquet", index=False)
+        parquet_file = self.output_dir / "metadata.parquet"
+        
+        # Resume support: merge with existing data
+        if parquet_file.exists():
+            existing_df = pd.read_parquet(parquet_file)
+            # Combine and deduplicate by sample_id
+            df = pd.concat([existing_df, df], ignore_index=True)
+            df = df.drop_duplicates(subset=['sample_id'], keep='last')
+            df = df.sort_values('sample_id').reset_index(drop=True)
+        
+        df.to_parquet(parquet_file, index=False)
     
     def save_outputs(self, processed_samples: List) -> None:
-        """Save outputs to Parquet file."""
+        """Save outputs to Parquet file (append mode for resume)."""
+        if not processed_samples:  # avoid empty list overwriting
+            return
+            
         output_rows = []
         
         for sample in processed_samples:
@@ -53,4 +69,14 @@ class ParquetManager:
             })
         
         df = pd.DataFrame(output_rows)
-        df.to_parquet(self.output_dir / "outputs.parquet", index=False)
+        parquet_file = self.output_dir / "outputs.parquet"
+        
+        # Resume support: merge with existing data
+        if parquet_file.exists():
+            existing_df = pd.read_parquet(parquet_file)
+            # Combine and deduplicate by sample_id
+            df = pd.concat([existing_df, df], ignore_index=True)
+            df = df.drop_duplicates(subset=['sample_id'], keep='last')
+            df = df.sort_values('sample_id').reset_index(drop=True)
+        
+        df.to_parquet(parquet_file, index=False)

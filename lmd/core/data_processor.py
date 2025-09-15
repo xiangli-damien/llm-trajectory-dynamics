@@ -94,7 +94,8 @@ class DataProcessor:
         
         # Compute generation metrics
         generation_metrics = self.evaluation_engine.compute_generation_metrics(
-            generation_result.scores
+            generation_result.scores,
+            generation_result.generated_tokens[0].tolist()
         )
         
         # Parse answer and check correctness

@@ -78,13 +78,17 @@ class ZarrManager:
         
         # Per-token storage if needed
         if self.hidden_state_spec.need_per_token:
-            self._arrays["answer_tok_values"] = self._store.require_dataset(
-                "answer_tok_values",
-                shape=(0, L, H),
-                chunks=(max(512, L * 2), L, H),
-                dtype="float16",
-                compressor=compressor
-            )
+            # Check if array already exists (for resume)
+            if "answer_tok_values" in self._store:
+                self._arrays["answer_tok_values"] = self._store["answer_tok_values"]
+            else:
+                self._arrays["answer_tok_values"] = self._store.require_dataset(
+                    "answer_tok_values",
+                    shape=(0, L, H),
+                    chunks=(max(512, L * 2), L, H),
+                    dtype="float16",
+                    compressor=compressor
+                )
             
             self._arrays["answer_tok_ptr"] = self._store.require_dataset(
                 "answer_tok_ptr",

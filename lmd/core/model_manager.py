@@ -1,6 +1,7 @@
 """Model management and generation utilities."""
 
 import torch
+import inspect
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -49,8 +50,7 @@ class ModelManager:
         """Load the model, tokenizer, and configuration."""
         # Load configuration
         self._config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
-        self._config.output_hidden_states = True
-        
+
         # Load model
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
@@ -61,13 +61,23 @@ class ModelManager:
         )
         self._model.eval()
 
-        # Ensure generation config is consistent and silence HF warnings
         gen_cfg = self._model.generation_config
-        gen_cfg.return_dict_in_generate = True
-        gen_cfg.output_hidden_states = True
-        gen_cfg.output_scores = True
-        if hasattr(gen_cfg, "top_k"):
-            gen_cfg.top_k = None
+        try:
+            gen_cfg.update(
+                return_dict_in_generate=True,
+                output_hidden_states=True,
+                output_scores=True,
+                top_k=None,
+            )
+        except AttributeError:
+            for k, v in dict(
+                return_dict_in_generate=True,
+                output_hidden_states=True,
+                output_scores=True,
+                top_k=None,
+            ).items():
+                if hasattr(gen_cfg, k):
+                    setattr(gen_cfg, k, v)
         
         # Load tokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(
@@ -163,7 +173,9 @@ class ModelManager:
         
         # Generate with hidden states and scores
         with torch.inference_mode():
-            gen_output = self.model.generate(
+            sig = inspect.signature(self.model.generate)
+
+            base_kwargs = dict(
                 input_ids=input_ids.to(device),
                 attention_mask=attention_mask.to(device),
                 max_new_tokens=gen_config.max_new_tokens,
@@ -174,8 +186,16 @@ class ModelManager:
                 pad_token_id=self.tokenizer.pad_token_id,
                 return_dict_in_generate=True,
                 output_scores=True,
-                output_hidden_states=True
+                output_hidden_states=True,
             )
+
+            if "generation_config" in sig.parameters:
+                base_kwargs["generation_config"] = self.model.generation_config
+
+            if (not gen_config.do_sample) and "top_k" in sig.parameters:
+                base_kwargs["top_k"] = None
+
+            gen_output = self.model.generate(**base_kwargs)
         
         # Extract results
         sequences = gen_output.sequences
