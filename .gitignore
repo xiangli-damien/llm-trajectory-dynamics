@@ -142,13 +142,12 @@ dmypy.json
 *.hdf5
 
 # Data files
-*.csv
 *.tsv
-*.jsonl
-*.json
 *.parquet
 *.zarr
 *.zarr/
+
+notebooks/
 
 # Logs
 *.log
@@ -171,12 +170,6 @@ log/
 ehthumbs.db
 Thumbs.db
 
-# Project specific
-# LMD analysis directory
-lmd/analysis/
-
-# Notebooks directory
-notebooks/
 
 # Storage directory (keep only datasets)
 storage/
@@ -213,3 +206,16 @@ mlruns/
 poetry.lock
 all_code_extract.txt
 all_code_extract.txt
+
+
+
+archive/
+archive.py
+
+
+# ignore only top-level txt files
+/*.txt
+
+
+!storage/datasets/
+!storage/datasets/**

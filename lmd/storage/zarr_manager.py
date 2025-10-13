@@ -16,12 +16,14 @@ class ZarrManager:
                  storage_path: Path,
                  model_metadata: ModelMetadata,
                  hidden_state_spec: HiddenStateSpec,
-                 n_samples_estimate: int):
+                 n_samples_estimate: int,
+                 chunk_t: int = 64):  # Added chunk_t parameter
         """Initialize Zarr manager."""
         self.storage_path = Path(storage_path)
         self.model_metadata = model_metadata
         self.hidden_state_spec = hidden_state_spec
         self.n_samples_estimate = n_samples_estimate
+        self.chunk_t = chunk_t  # Store chunk size
         
         self._store = None
         self._arrays = {}
@@ -45,7 +47,7 @@ class ZarrManager:
             self._arrays["mean_answer_hs"] = self._store.require_dataset(
                 "mean_answer_hs",
                 shape=(self.n_samples_estimate, L, H),
-                chunks=(min(1024, self.n_samples_estimate), L, H),
+                chunks=(min(64, self.n_samples_estimate), L, H),
                 dtype="float32",
                 compressor=compressor
             )
@@ -54,7 +56,7 @@ class ZarrManager:
             self._arrays["prompt_last_hs"] = self._store.require_dataset(
                 "prompt_last_hs",
                 shape=(self.n_samples_estimate, L, H),
-                chunks=(min(1024, self.n_samples_estimate), L, H),
+                chunks=(min(64, self.n_samples_estimate), L, H),
                 dtype="float32",
                 compressor=compressor
             )
@@ -82,10 +84,11 @@ class ZarrManager:
             if "answer_tok_values" in self._store:
                 self._arrays["answer_tok_values"] = self._store["answer_tok_values"]
             else:
+                # Use configurable chunk_t instead of fixed value
                 self._arrays["answer_tok_values"] = self._store.require_dataset(
                     "answer_tok_values",
                     shape=(0, L, H),
-                    chunks=(max(512, L * 2), L, H),
+                    chunks=(self.chunk_t, L, H),  # Use configurable chunk size
                     dtype="float16",
                     compressor=compressor
                 )

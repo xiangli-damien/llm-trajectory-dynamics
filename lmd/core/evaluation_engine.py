@@ -11,11 +11,12 @@ class EvaluationEngine:
     
     @staticmethod
     def compute_generation_metrics(
-        scores: List[torch.Tensor],
+        scores: Optional[List[torch.Tensor]],
         generated_token_ids: Optional[List[int]] = None,
     ) -> 'GenerationMetrics':
         from .data_processor import GenerationMetrics
 
+        # Handle case when scores is None or empty
         if not scores:
             return GenerationMetrics(
                 max_probability=0.0,

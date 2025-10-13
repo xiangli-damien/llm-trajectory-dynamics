@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from .model_manager import ModelManager
 from .hidden_state_extractor import HiddenStateExtractor, HiddenStateData
 from .evaluation_engine import EvaluationEngine
+from .online_metrics import OnlineMetricsProcessor
 from ..data.answer_parser import AnswerParser
 from ..data.prompt_templates import PromptTemplateManager
 from ..utils.types import SampleRecord, GenerationConfig, HiddenStateSpec
@@ -72,8 +73,20 @@ class DataProcessor:
         # Apply chat template
         input_ids = self._apply_chat_template(prompt)
         
+        # Check if we should use online metrics collection
+        use_online_metrics = not getattr(self.model_manager, "_output_scores", False)
+        metrics_processor = None
+        logits_processors = None
+        
+        if use_online_metrics:
+            # Use online metrics processor for greedy generation
+            metrics_processor = OnlineMetricsProcessor(greedy=(not gen_config.do_sample))
+            logits_processors = [metrics_processor]
+        
         # Generate sequence with hidden states
-        generation_result = self.model_manager.generate_sequence(input_ids, gen_config)
+        generation_result = self.model_manager.generate_sequence(
+            input_ids, gen_config, logits_processors=logits_processors
+        )
         
         # Decode generated text
         generated_text = self.model_manager.tokenizer.decode(
@@ -93,10 +106,20 @@ class DataProcessor:
         )
         
         # Compute generation metrics
-        generation_metrics = self.evaluation_engine.compute_generation_metrics(
-            generation_result.scores,
-            generation_result.generated_tokens[0].tolist()
-        )
+        if use_online_metrics and metrics_processor is not None:
+            # Get metrics from online processor
+            metrics_dict = metrics_processor.finalize()
+            generation_metrics = GenerationMetrics(
+                max_probability=metrics_dict['max_probability'],
+                perplexity=metrics_dict['perplexity'],
+                entropy=metrics_dict['entropy']
+            )
+        else:
+            # Use traditional evaluation engine
+            generation_metrics = self.evaluation_engine.compute_generation_metrics(
+                generation_result.scores,
+                generation_result.generated_tokens[0].tolist()
+            )
         
         # Parse answer and check correctness
         parse_result = self.answer_parser.parse_and_label(generated_text, sample)

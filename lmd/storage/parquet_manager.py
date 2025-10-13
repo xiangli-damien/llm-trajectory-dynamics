@@ -15,7 +15,7 @@ class ParquetManager:
     
     def save_metadata(self, processed_samples: List) -> None:
         """Save metadata to Parquet file (append mode for resume)."""
-        if not processed_samples:  # avoid empty list overwriting
+        if not processed_samples:
             return
             
         metadata_rows = []
@@ -43,7 +43,6 @@ class ParquetManager:
         # Resume support: merge with existing data
         if parquet_file.exists():
             existing_df = pd.read_parquet(parquet_file)
-            # Combine and deduplicate by sample_id
             df = pd.concat([existing_df, df], ignore_index=True)
             df = df.drop_duplicates(subset=['sample_id'], keep='last')
             df = df.sort_values('sample_id').reset_index(drop=True)

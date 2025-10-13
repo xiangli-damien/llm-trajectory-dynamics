@@ -5,6 +5,7 @@ import inspect
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers.generation.logits_process import LogitsProcessorList
 from dataclasses import dataclass
 
 from ..utils.types import GenerationConfig, ModelMetadata
@@ -19,7 +20,7 @@ class GenerationResult:
     input_length: int
     generated_length: int
     hidden_states: List[Tuple[torch.Tensor, ...]]
-    scores: List[torch.Tensor]
+    scores: Optional[List[torch.Tensor]]
     finish_reason: str
 
 
@@ -37,6 +38,7 @@ class ModelManager:
         self._tokenizer = None
         self._config = None
         self._metadata = None
+        self._output_scores = False
         
     def _resolve_dtype(self, dtype: str) -> torch.dtype:
         """Resolve torch dtype from string."""
@@ -66,14 +68,14 @@ class ModelManager:
             gen_cfg.update(
                 return_dict_in_generate=True,
                 output_hidden_states=True,
-                output_scores=True,
+                output_scores=self._output_scores,
                 top_k=None,
             )
         except AttributeError:
             for k, v in dict(
                 return_dict_in_generate=True,
                 output_hidden_states=True,
-                output_scores=True,
+                output_scores=self._output_scores,
                 top_k=None,
             ).items():
                 if hasattr(gen_cfg, k):
@@ -95,6 +97,15 @@ class ModelManager:
         # Probe actual hidden state layer count
         self._metadata.n_layers = self._probe_hidden_state_layers()
     
+    def set_output_scores(self, output_scores: bool) -> None:
+        """Set whether to output scores during generation."""
+        self._output_scores = output_scores
+        if self._model and hasattr(self._model, 'generation_config'):
+            try:
+                self._model.generation_config.output_scores = output_scores
+            except:
+                pass
+    
     def _extract_metadata(self) -> ModelMetadata:
         """Extract model metadata."""
         config = self._config
@@ -109,7 +120,7 @@ class ModelManager:
         
         return ModelMetadata(
             model_name=self.model_name,
-            n_layers=n_layers_with_emb,  # Will be updated by probe
+            n_layers=n_layers_with_emb,
             hidden_dim=getattr(config, "hidden_size", None) or \
                       getattr(config, "n_embd", None) or \
                       getattr(config, "d_model", None),
@@ -161,8 +172,18 @@ class ModelManager:
             raise RuntimeError("Metadata not available. Call load_model() first.")
         return self._metadata
     
-    def generate_sequence(self, input_ids: torch.Tensor, gen_config: GenerationConfig) -> GenerationResult:
-        """Generate text sequence with hidden states and scores."""
+    def generate_sequence(self, input_ids: torch.Tensor, gen_config: GenerationConfig,
+                         logits_processors: Optional[List[Any]] = None) -> GenerationResult:
+        """Generate text sequence with hidden states and optional scores.
+        
+        Args:
+            input_ids: Input token ids
+            gen_config: Generation configuration
+            logits_processors: Optional list of logits processors
+            
+        Returns:
+            GenerationResult with generated tokens and hidden states
+        """
         device = next(self.model.parameters()).device
         
         # Create attention mask for safety
@@ -171,7 +192,7 @@ class ModelManager:
         # Get termination tokens
         terminators = self._get_termination_tokens()
         
-        # Generate with hidden states and scores
+        # Generate with hidden states and optionally scores
         with torch.inference_mode():
             sig = inspect.signature(self.model.generate)
 
@@ -185,9 +206,13 @@ class ModelManager:
                 eos_token_id=terminators,
                 pad_token_id=self.tokenizer.pad_token_id,
                 return_dict_in_generate=True,
-                output_scores=True,
+                output_scores=self._output_scores,
                 output_hidden_states=True,
             )
+            
+            # Add logits processors if provided
+            if logits_processors:
+                base_kwargs["logits_processor"] = LogitsProcessorList(logits_processors)
 
             if "generation_config" in sig.parameters:
                 base_kwargs["generation_config"] = self.model.generation_config
@@ -207,7 +232,7 @@ class ModelManager:
         if generated_length > 0 and (hidden_states is None or len(hidden_states) == 0):
             raise RuntimeError("Hidden states not returned by generate(). Check generation config.")
 
-        scores = gen_output.scores
+        scores = gen_output.scores if self._output_scores else None
         
         # Determine finish reason
         finish_reason = self._determine_finish_reason(

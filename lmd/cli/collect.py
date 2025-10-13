@@ -6,16 +6,33 @@ import json
 import time
 import torch
 import gc
+import signal
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from tqdm import tqdm
+from contextlib import contextmanager
 
 from ..core import ModelManager, DataProcessor
 from ..data import AnswerParser, PromptTemplateManager, DatasetRegistry
 from ..storage import ZarrManager, ParquetManager
 from ..utils.types import GenerationConfig, HiddenStateSpec
 from ..utils.seed import set_seed
+
+
+@contextmanager
+def time_limit(seconds):
+    """Context manager for timeout."""
+    def handler(signum, frame):
+        raise TimeoutError("Sample processing timeout")
+    
+    old_handler = signal.signal(signal.SIGALRM, handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 class DataCollector:
@@ -101,6 +118,9 @@ class DataCollector:
         print(f"Datasets: {', '.join(self.args.datasets)}")
         print(f"Max samples: {self.args.max_samples or 'All'}")
         print(f"Max tokens: {self.args.max_new_tokens}")
+        print(f"Flush every: {self.args.flush_every} samples")
+        print(f"Timeout: {self.args.timeout_s}s per sample")
+        print(f"Output scores: {self.args.output_scores}")
         print("="*80 + "\n")
         
         for model_name in self.args.models:
@@ -132,7 +152,13 @@ class DataCollector:
             model_path=str(self.model_root / model_name)
         )
         model_manager.load_model()
+        
+        # Configure output scores
+        model_manager.set_output_scores(self.args.output_scores)
+        
         print(f"✓ Model loaded: {model_manager.metadata.n_layers} layers, {model_manager.metadata.hidden_dim} dim")
+        print(f"✓ Output scores: {self.args.output_scores}")
+        print(f"✓ Using online metrics: {not self.args.output_scores}")
         
         # Process each dataset
         model_results = {
@@ -183,7 +209,8 @@ class DataCollector:
             storage_path=zarr_path,
             model_metadata=model_manager.metadata,
             hidden_state_spec=self.hidden_state_spec,
-            n_samples_estimate=n_samples
+            n_samples_estimate=n_samples,
+            chunk_t=self.args.zarr_chunk_t
         )
         
         parquet_path = self.output_root / "parquet" / model_manager.model_name / dataset_name
@@ -196,20 +223,38 @@ class DataCollector:
             if self.args.verbose and start_idx > 0:
                 print(f"Resuming {dataset_name} at sample index {start_idx}")
         
+        # Override with start_index if specified
+        if self.args.start_index is not None:
+            start_idx = max(start_idx, self.args.start_index)
+        
+        # Parse skip indices
+        skip_set = set()
+        if self.args.skip_indices.strip():
+            skip_set = {int(x) for x in self.args.skip_indices.split(",") if x.strip().isdigit()}
+        
         # Process samples
         processed_samples = []
         correct_count = 0
         error_count = 0
+        processed_count = 0  # Track successfully processed samples
         
         with tqdm(total=n_samples, desc=f"{dataset_name:15}", unit="sample", initial=start_idx) as pbar:
             for i, sample in enumerate(samples):
                 if i < start_idx:
                     continue
+                
+                if i in skip_set:
+                    zarr_manager.mark_empty(sample_idx=i, sample_id=sample.sample_id)
+                    pbar.update(1)
+                    continue
                     
                 try:
-                    # Process sample
-                    processed = data_processor.process_sample(sample, self.gen_config)
+                    # Process sample with timeout
+                    with time_limit(self.args.timeout_s):
+                        processed = data_processor.process_sample(sample, self.gen_config)
+                    
                     processed_samples.append(processed)
+                    processed_count += 1  # Increment for successful processing
                     
                     if processed.is_correct:
                         correct_count += 1
@@ -225,10 +270,27 @@ class DataCollector:
                         }
                     )
                     
-                    # Update progress
-                    acc = correct_count / len(processed_samples) * 100
+                    # Free large arrays immediately after saving
+                    processed.hidden_state_data.per_token_states = None
+                    processed.hidden_state_data.mean_states = None
+                    processed.hidden_state_data.prompt_final_state = None
+                    
+                    # Update progress with correct accuracy calculation
+                    acc = correct_count / processed_count * 100 if processed_count > 0 else 0
                     pbar.set_postfix({'Acc': f"{acc:.1f}%", 'Err': error_count})
                     
+                    # Periodic flush to bound memory
+                    if len(processed_samples) >= self.args.flush_every:
+                        parquet_manager.save_metadata(processed_samples)
+                        parquet_manager.save_outputs(processed_samples)
+                        processed_samples.clear()
+                    
+                except TimeoutError:
+                    error_count += 1
+                    zarr_manager.mark_empty(sample_idx=i, sample_id=sample.sample_id)
+                    if self.args.verbose:
+                        print(f"\nTimeout on sample {i}")
+                        
                 except Exception as e:
                     error_count += 1
                     zarr_manager.mark_empty(sample_idx=i, sample_id=sample.sample_id)
@@ -237,22 +299,26 @@ class DataCollector:
                 
                 pbar.update(1)
                 
-                # Periodic GPU cleanup
-                if (i + 1) % 50 == 0:
+                # Aggressive memory cleanup
+                if (i + 1) % 25 == 0:
                     torch.cuda.empty_cache()
+                    gc.collect()
+        
+        # Final flush
+        if processed_samples:
+            parquet_manager.save_metadata(processed_samples)
+            parquet_manager.save_outputs(processed_samples)
         
         # Finalize storage
         zarr_manager.finalize()
-        parquet_manager.save_metadata(processed_samples)
-        parquet_manager.save_outputs(processed_samples)
         
-        # Return statistics
-        accuracy = correct_count / len(processed_samples) if processed_samples else 0
-        print(f"✓ {dataset_name}: {correct_count}/{n_samples} correct ({accuracy:.1%})")
+        # Return statistics with correct accuracy
+        accuracy = correct_count / processed_count if processed_count > 0 else 0
+        print(f"✓ {dataset_name}: {correct_count}/{processed_count} correct ({accuracy:.1%}), {error_count} errors")
         
         return {
             "n_samples": n_samples,
-            "n_processed": len(processed_samples),
+            "n_processed": processed_count,
             "n_correct": correct_count,
             "n_errors": error_count,
             "accuracy": accuracy
@@ -273,18 +339,21 @@ class DataCollector:
         
         total_samples = 0
         total_correct = 0
+        total_processed = 0
         
         for model_name, model_data in self.results["models"].items():
             print(f"\n{model_name}:")
             for dataset_name, stats in model_data.get("datasets", {}).items():
-                n_samples = stats.get("n_samples", 0)
+                n_processed = stats.get("n_processed", 0)
                 n_correct = stats.get("n_correct", 0)
                 acc = stats.get("accuracy", 0)
-                print(f"  {dataset_name:15}: {n_correct:4}/{n_samples:4} ({acc:.1%})")
-                total_samples += n_samples
+                print(f"  {dataset_name:15}: {n_correct:4}/{n_processed:4} ({acc:.1%})")
+                total_samples += stats.get("n_samples", 0)
+                total_processed += n_processed
                 total_correct += n_correct
         
-        print(f"\nTotal: {total_correct}/{total_samples} ({total_correct/total_samples*100:.1%})")
+        overall_acc = total_correct / total_processed * 100 if total_processed > 0 else 0
+        print(f"\nTotal: {total_correct}/{total_processed} ({overall_acc:.1%})")
         print(f"Time: {total_time/60:.1f} minutes")
         print(f"Output: {self.output_root}")
         print("="*80)
@@ -310,13 +379,29 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--language", type=str, default="en")
     
-    # Hidden states - Fixed to allow turning off
+    # Hidden states
     parser.add_argument("--save-per-token", dest="save_per_token", action="store_true", default=True)
     parser.add_argument("--no-save-per-token", dest="save_per_token", action="store_false")
     parser.add_argument("--save-mean", dest="save_mean", action="store_true", default=True)
     parser.add_argument("--no-save-mean", dest="save_mean", action="store_false")
     parser.add_argument("--save-prompt-last", dest="save_prompt_last", action="store_true", default=True)
     parser.add_argument("--no-save-prompt-last", dest="save_prompt_last", action="store_false")
+    
+    # Memory management
+    parser.add_argument("--flush-every", type=int, default=100,
+                       help="Flush parquet every N samples to bound memory")
+    parser.add_argument("--timeout-s", type=int, default=1800,
+                       help="Timeout per sample in seconds")
+    parser.add_argument("--zarr-chunk-t", type=int, default=64,
+                       help="Chunk size for token axis in zarr")
+    parser.add_argument("--output-scores", action="store_true", default=False,
+                       help="Output scores for metrics (uses lots of memory)")
+    
+    # Resume and skip
+    parser.add_argument("--start-index", type=int, default=None,
+                       help="Override resume and start from this index")
+    parser.add_argument("--skip-indices", type=str, default="",
+                       help="Comma-separated indices to skip")
     
     # Options
     parser.add_argument("--seed", type=int, default=42)
