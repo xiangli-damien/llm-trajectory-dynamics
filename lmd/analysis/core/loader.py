@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Iterator, List, Tuple, Dict, Any
+from typing import Iterator, List, Tuple, Dict, Any, Optional
 from .layers import apply_layer_selection
 from .types import LayerSpec
 
@@ -26,11 +26,13 @@ class StateLoader:
 
 class TokenStreamer:
     def __init__(self, arrays: Dict[str, Any], indices: np.ndarray, 
-                 layer_spec: LayerSpec, batch_size: int = 128):
+                 layer_spec: LayerSpec, batch_size: int = 128, 
+                 last_k: Optional[int] = None):
         self.arrays = arrays
         self.indices = indices
         self.layer_spec = layer_spec
         self.batch_size = batch_size
+        self.last_k = last_k
         
         if arrays.get("answer_tok_values") is None or arrays.get("answer_tok_ptr") is None:
             raise KeyError("per-token arrays not available")
@@ -55,6 +57,8 @@ class TokenStreamer:
                 if b <= a:
                     seqs.append(np.empty((0, 0, 0), np.float32))
                 else:
+                    if self.last_k is not None:
+                        a = max(a, b - int(self.last_k))
                     data = self.tok_vals.oindex[a:b].astype(np.float32, copy=False)
                     data = apply_layer_selection(data, self.layer_spec)
                     seqs.append(data)

@@ -54,14 +54,7 @@ class CoE(MetricBase):
         h_last = states[:, -1, :]
         
         mag_diff = h_last - h_first
-        mag_denom_raw = np.linalg.norm(mag_diff, axis=1, keepdims=True)
-        mag_denom = np.where(mag_denom_raw > 1e-6, mag_denom_raw, 1.0)
-        
-        cos_angle = np.sum(h_last * h_first, axis=1) / (
-            np.linalg.norm(h_last, axis=1) * np.linalg.norm(h_first, axis=1) + 1e-8
-        )
-        ang_denom_raw = np.arccos(np.clip(cos_angle, -1, 1))
-        ang_denom = np.where(ang_denom_raw > 1e-6, ang_denom_raw, 1.0)
+        mag_denom = np.maximum(np.linalg.norm(mag_diff, axis=1, keepdims=True), 1e-6)
         
         diffs = states[:, 1:, :] - states[:, :-1, :]
         mags = np.linalg.norm(diffs, axis=2) / mag_denom
@@ -69,17 +62,22 @@ class CoE(MetricBase):
         h_curr = states[:, 1:, :]
         h_prev = states[:, :-1, :]
         dots = np.sum(h_curr * h_prev, axis=2)
-        norms_curr = np.linalg.norm(h_curr, axis=2) + 1e-8
-        norms_prev = np.linalg.norm(h_prev, axis=2) + 1e-8
+        norms_curr = np.maximum(np.linalg.norm(h_curr, axis=2), 1e-8)
+        norms_prev = np.maximum(np.linalg.norm(h_prev, axis=2), 1e-8)
         cos_angles = dots / (norms_curr * norms_prev)
-        angles_raw = np.arccos(np.clip(cos_angles, -1, 1))
+        angles_raw = np.arccos(np.clip(cos_angles, -1.0, 1.0))
         
-        mask = (ang_denom_raw > 1e-6)[:, np.newaxis]
-        angles = np.where(mask, angles_raw / ang_denom[:, None], angles_raw)
+        cos_end = np.sum(h_last * h_first, axis=1) / np.maximum(
+            np.linalg.norm(h_last, axis=1) * np.linalg.norm(h_first, axis=1), 1e-8
+        )
+        ang_denom = np.maximum(np.arccos(np.clip(cos_end, -1.0, 1.0)), 1e-6)
+        angles_normalized = angles_raw / ang_denom[:, None]
         
-        coe_r = np.mean(mags, axis=1) - np.mean(angles, axis=1)
-        x_coords = mags * np.cos(angles)
-        y_coords = mags * np.sin(angles)
-        coe_c = np.sqrt(np.mean(x_coords, axis=1)**2 + np.mean(y_coords, axis=1)**2)
+        coe_r = np.mean(mags, axis=1) - np.mean(angles_normalized, axis=1)
+        
+        vec_x = np.sum(mags * np.cos(angles_raw), axis=1)
+        vec_y = np.sum(mags * np.sin(angles_raw), axis=1)
+        total_mag = np.maximum(np.sum(mags, axis=1), 1e-12)
+        coe_c = np.sqrt(vec_x**2 + vec_y**2) / total_mag
         
         return coe_r.astype(np.float32), coe_c.astype(np.float32)

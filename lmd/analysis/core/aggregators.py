@@ -8,6 +8,9 @@ class Aggregators:
             return Aggregators.median
         elif name == "mean":
             return Aggregators.mean
+        elif name == "lastk_mean":
+            k = params.get('k', 8)
+            return Aggregators.lastk_mean(k)
         elif name == "quantile":
             q = params.get('q', 0.75)
             return Aggregators.quantile(q)
@@ -51,4 +54,13 @@ class Aggregators:
             k2 = min(max(k, 1), v.size)
             idx = np.argpartition(v, -k2)[-k2:]
             return float(np.mean(v[idx]))
+        return fn
+    
+    @staticmethod
+    def lastk_mean(k: int = 8) -> Callable[[np.ndarray], float]:
+        def fn(v: np.ndarray) -> float:
+            if v.size == 0:
+                return 0.0
+            k2 = min(max(k, 1), v.size)
+            return float(np.mean(v[-k2:]))
         return fn

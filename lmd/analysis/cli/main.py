@@ -25,6 +25,8 @@ from ..metrics import ndr, rownull, robust_late, coe, fisher_exact
 from ..metrics import cids, gmm_discriminative
 from ..metrics import subspace_learned, fusion
 from ..metrics import pca_classifier, supcon_tail
+from ..metrics import nrleak, dac, als, dynamics_combo
+from ..metrics import rownull_combo, supcon_v2
 
 def setup_registry() -> MetricRegistry:
     registry = MetricRegistry()
@@ -40,6 +42,19 @@ def setup_registry() -> MetricRegistry:
     registry.register("fusion_rankavg", fusion.FusionRankAvg)
     registry.register("pca_cls", pca_classifier.PCABasisClassifier)
     registry.register("supcon_tail", supcon_tail.SupConTail)
+    registry.register("rownull_combo", rownull_combo.RowNullCombo)
+    
+    from ..metrics.gmm_unsupervised import GMMUnsupervised
+    from ..metrics.certainty import Certainty
+    
+    registry.register("gmm_unsup", GMMUnsupervised)
+    registry.register("certainty", Certainty)
+    
+    registry.register("nrleak", nrleak.NRLeak)
+    registry.register("dac", dac.DAC)
+    registry.register("als", als.ALS)
+    registry.register("din_combo", dynamics_combo.DynamicsCombo)
+    registry.register("supcon_v2", supcon_v2.SupConV2)
     return registry
 
 def load_config(config_path: Optional[Path]) -> ExperimentConfig:
@@ -74,13 +89,17 @@ def parse_config_dict(data: dict) -> ExperimentConfig:
     if 'subset' in data:
         subset_spec = SubsetSpec(**data['subset'])
     
+    token_agg_params = data.get('token_agg_params', {})
+    if 'last_k' in data:
+        token_agg_params['last_k'] = data['last_k']
+    
     return ExperimentConfig(
         data_mode=data_mode,
         layer_spec=layer_spec,
         metrics=metrics,
         subset_spec=subset_spec,
         token_agg=data.get('token_agg', 'median'),
-        token_agg_params=data.get('token_agg_params', {})
+        token_agg_params=token_agg_params
     )
 
 def main():
@@ -91,17 +110,22 @@ def main():
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--language", type=str, default="en")
     parser.add_argument("--model-path", type=Path, default=None)
+    parser.add_argument("--lm-var-ratio", type=float, default=1.0,
+                       help="Variance ratio for LM head SVD rank (1.0 = full row space)")
     
     parser.add_argument("--config", type=Path, help="YAML configuration file")
     parser.add_argument("--data-mode", choices=["state_mean", "state_prompt_last", "token"],
-                       default="state_mean")
+                       default="state_prompt_last")
     parser.add_argument("--metrics", nargs="+", 
                        default=[
-                           "cids", "gmm_disc",
+                           "cids", "gmm_disc", "gmm_unsup",
                            "subspace_fda", "spca_sup",
                            "pca_cls",
                            "fusion_rankavg",
-                           "ndr", "rownull", "robust_late", "coe"
+                           "ndr", "rownull", "robust_late", "coe",
+                           "certainty",
+                           "nrleak", "dac", "als", "din_combo",
+                           "rownull_combo"
                        ])
     
     parser.add_argument("--drop-embedding", action="store_true")
@@ -119,6 +143,7 @@ def main():
     parser.add_argument("--token-agg", default="median")
     parser.add_argument("--token-agg-q", type=float, default=0.75)
     parser.add_argument("--token-agg-k", type=int, default=8)
+    parser.add_argument("--token-last-k", type=int, default=None, help="Only load last k tokens per sample")
     
     parser.add_argument("--save-json", type=Path)
     parser.add_argument("--save-parquet", type=Path)
@@ -158,6 +183,11 @@ def main():
             token_agg_params['q'] = args.token_agg_q
         elif args.token_agg == "topk_mean":
             token_agg_params['k'] = args.token_agg_k
+        elif args.token_agg == "lastk_mean":
+            token_agg_params['k'] = args.token_agg_k
+        
+        if args.token_last_k is not None:
+            token_agg_params['last_k'] = args.token_last_k
         
         config = ExperimentConfig(
             data_mode=data_mode_map[args.data_mode],
@@ -182,7 +212,7 @@ def main():
     if args.model_path:
         if args.verbose:
             print(f"Loading LM head from {args.model_path}")
-        lm_head = load_lm_head(args.model_path, var_ratio=0.95, exact_mode=False)
+        lm_head = load_lm_head(args.model_path, var_ratio=args.lm_var_ratio, exact_mode=False)
     
     ctx = RunContext(config=run_cfg, data=data, lm_head=lm_head)
     

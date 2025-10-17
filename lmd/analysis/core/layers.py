@@ -3,7 +3,6 @@ from typing import Union, Optional, Dict, Any
 from .types import LayerSpec
 
 def resolve_layer_indices(total_layers: int, spec: LayerSpec) -> Union[slice, np.ndarray]:
-    """Resolve layer specification to indices or slice."""
     if spec.use_layers is not None:
         indices = np.array(spec.use_layers, dtype=np.int64)
         indices = indices[indices < total_layers]
@@ -32,7 +31,6 @@ def resolve_layer_indices(total_layers: int, spec: LayerSpec) -> Union[slice, np
         return np.arange(start, end, spec.stride, dtype=np.int64)
 
 def apply_layer_selection(data: np.ndarray, spec: LayerSpec) -> np.ndarray:
-    """Apply layer selection to data array."""
     if data.ndim < 2:
         return data
     
@@ -52,8 +50,7 @@ def apply_layer_selection(data: np.ndarray, spec: LayerSpec) -> np.ndarray:
             return data[indices]
 
 def compute_shared_cache(states: np.ndarray, lm_head=None, 
-                        var_ratio: float = 0.95) -> Dict[str, np.ndarray]:
-    """Compute shared cache for metrics."""
+                        var_ratio: float = None) -> Dict[str, np.ndarray]:
     N, L, H = states.shape
     cache = {}
     

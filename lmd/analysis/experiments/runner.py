@@ -41,7 +41,7 @@ class ExperimentRunner:
             print(f"Loaded states: shape={states.shape}")
             print("Building shared cache...")
         
-        cache = compute_shared_cache(states, ctx.lm_head, var_ratio=0.95)
+        cache = compute_shared_cache(states, ctx.lm_head, var_ratio=None)
         ctx.shared_cache.update(cache)
         
         results['layerwise'] = self._layerwise_significance(ctx, states)
@@ -81,56 +81,69 @@ class ExperimentRunner:
         return results
     
     def _run_token_mode(self, ctx: RunContext, config: ExperimentConfig, 
-                       results: Dict, n_jobs: int, verbose: bool) -> Dict[str, Any]:
-        
+                   results: Dict, n_jobs: int, verbose: bool) -> Dict[str, Any]:
+    
         agg_fn = Aggregators.get(config.token_agg, **config.token_agg_params)
+        
+        last_k = config.token_agg_params.get('last_k', None)
         streamer = TokenStreamer(ctx.arrays, ctx.sample_rows, 
-                                config.layer_spec, batch_size=128)
+                                config.layer_spec, batch_size=128, last_k=last_k)
         
-        metric_instances = []
-        for cfg in config.metrics:
-            instance = self.registry.create_instance(cfg)
-            if instance.requires_lm_head and ctx.lm_head is None:
-                if verbose:
-                    print(f"Skipping {cfg.name}: requires lm_head but none provided")
-                continue
-            if "token" not in instance.supported_modes:
-                if verbose:
-                    print(f"Skipping {cfg.name}: does not support token mode")
-                continue
-            metric_instances.append(instance)
+        metric_order = self._get_execution_order(config.metrics)
         
-        if not metric_instances:
+        all_scores = {}
+        all_directions = {}
+        
+        for metric_configs in metric_order:
             if verbose:
-                print("No metrics support token mode or satisfy requirements")
-            return results
-        
-        token_results = {m.name: {} for m in metric_instances}
-        
-        batch_count = 0
-        for batch_indices, sequences in streamer.stream():
-            start_idx = batch_count * 128
-            end_idx = start_idx + len(batch_indices)
+                print(f"Processing {len(metric_configs)} metrics in token mode...")
             
-            for instance in metric_instances:
-                try:
-                    output = instance.compute_token(ctx, sequences, agg_fn)
-                    for key, values in output.scores.items():
-                        if key not in token_results[instance.name]:
-                            token_results[instance.name][key] = np.zeros(len(ctx.labels), dtype=np.float32)
-                        token_results[instance.name][key][start_idx:end_idx] = values
-                except NotImplementedError:
+            metric_instances = []
+            for cfg in metric_configs:
+                instance = self.registry.create_instance(cfg)
+                if instance.requires_lm_head and ctx.lm_head is None:
                     if verbose:
-                        print(f"Warning: {instance.name} claims token support but not implemented")
+                        print(f"Skipping {cfg.name}: requires lm_head but none provided")
                     continue
+                if "token" not in instance.supported_modes:
+                    if verbose:
+                        print(f"Skipping {cfg.name}: does not support token mode")
+                    continue
+                metric_instances.append(instance)
             
-            batch_count += 1
+            if not metric_instances:
+                continue
+            
+            token_results = {m.name: {} for m in metric_instances}
+            
+            write_position = 0
+            for batch_indices, sequences in streamer.stream():
+                start_idx = write_position
+                end_idx = start_idx + len(batch_indices)
+                
+                for instance in metric_instances:
+                    try:
+                        output = instance.compute_token(ctx, sequences, agg_fn)
+                        ctx.set_metric_state(instance.name, output.cache_state)
+                        for key, values in output.scores.items():
+                            if key not in token_results[instance.name]:
+                                token_results[instance.name][key] = np.zeros(len(ctx.labels), dtype=np.float32)
+                            token_results[instance.name][key][start_idx:end_idx] = values
+                        all_directions.update(output.directions)
+                    except NotImplementedError:
+                        if verbose:
+                            print(f"Warning: {instance.name} claims token support but not implemented")
+                        continue
+                
+                write_position = end_idx
+            
+            for name, scores in token_results.items():
+                all_scores.update(scores)
         
-        for name, scores in token_results.items():
-            if scores:
-                instance = next(m for m in metric_instances if m.name == name)
-                output = MetricOutput(name=name, scores=scores, directions=instance.output_specs)
-                self._merge_output(ctx, results, output)
+        results["scores"] = all_scores
+        for key, scores in all_scores.items():
+            if scores.ndim == 1 and key in all_directions:
+                results["evals"][key] = evaluate_metric(ctx.labels, scores, all_directions[key])
         
         if verbose:
             self._print_summary(results)
@@ -162,6 +175,18 @@ class ExperimentRunner:
                 tot_e = cache['dh_energy']
                 ratio = row_e / (tot_e + 1e-12)
                 diag['row_ratio'] = auc_effect(ratio, MetricDirection.HIGHER_BETTER)
+                
+                N, L_diff, _ = dq.shape
+                best_auroc = -1.0
+                best_k = L_diff
+                for test_k in range(2, min(L_diff + 1, 21)):
+                    tail_ratio = np.mean(ratio[:, -test_k:], axis=1)
+                    ev = evaluate_metric(labels, tail_ratio, MetricDirection.HIGHER_BETTER)
+                    if ev['auroc'] > best_auroc:
+                        best_auroc = ev['auroc']
+                        best_k = test_k
+                diag['row_ratio_best_k'] = best_k
+                diag['row_ratio_best_auroc'] = best_auroc
         
         if 'dq' in cache and cache['dq'].ndim == 3:
             dq_norm = np.linalg.norm(cache['dq'], axis=2)
@@ -229,6 +254,10 @@ class ExperimentRunner:
         if 'layerwise' in results and results['layerwise']:
             print("\nLayerwise significance (top effects):")
             for key, layer_results in results['layerwise'].items():
-                if layer_results:
+                if key == 'row_ratio_best_k':
+                    print(f"  Optimal tail window for row_ratio: {layer_results} layers")
+                elif key == 'row_ratio_best_auroc':
+                    print(f"  Best row_ratio AUROC: {layer_results:.4f}")
+                elif isinstance(layer_results, list) and layer_results:
                     sorted_layers = sorted(layer_results, key=lambda x: x['effect'], reverse=True)[:3]
                     print(f"  {key}: layers {[l['layer'] for l in sorted_layers]}")

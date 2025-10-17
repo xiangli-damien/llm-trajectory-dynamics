@@ -7,6 +7,15 @@ from .subspace_learned import TailFDA, SPCASupervised
 from .fusion import FusionRankAvg
 from .pca_classifier import PCABasisClassifier
 from .supcon_tail import SupConTail
+from .gmm_unsupervised import GMMUnsupervised
+from .certainty import Certainty
+from .rownull_combo import RowNullCombo
+
+from .nrleak import NRLeak
+from .dac import DAC
+from .als import ALS
+from .dynamics_combo import DynamicsCombo
+from .supcon_v2 import SupConV2
 
 __all__ = [
     'CoE',
@@ -18,5 +27,13 @@ __all__ = [
     'SPCASupervised',
     'FusionRankAvg',
     'PCABasisClassifier',
-    'SupConTail'
+    'SupConTail',
+    'GMMUnsupervised',
+    'Certainty',
+    'RowNullCombo',
+    'NRLeak',
+    'DAC',
+    'ALS',
+    'DynamicsCombo',
+    'SupConV2',
 ]
